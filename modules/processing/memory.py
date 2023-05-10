@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooProcessingError
@@ -190,7 +191,9 @@ class VolatilityManager:
             log.error("Configuration file memory.conf not found")
             self.options = False
             return
-
+        
+        self.options = Config("memory")
+        
         if isinstance(self.options.mask.pid_generic, int):
             self.mask_pid.append(self.options.mask.pid_generic)
         else:
