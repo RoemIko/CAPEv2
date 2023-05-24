@@ -198,4 +198,7 @@ domain_passlist = [
     "statuse.digitalcertvalidation.com",
     "certificates.intel.com",
     "hostonly.hostonly",
+    "adobe.com",
+    "googleapis.com",
+    "data.microsoft.com",
 ]
