@@ -1,5 +1,6 @@
 domain_passlist_re = [
     # Certificate Trust Update domains
+    r"^adobe\.com$"
     r"^ocsp\.usertrust\.com$",
     r"\.windows\.com$",
     r"^ocsp\.comodoca\.com$",
