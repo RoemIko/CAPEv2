@@ -13,7 +13,7 @@ greenlet = "2.0.1"
 Pebble = "4.6.3"
 # pymisp = "2.4.144"
 cryptography = "39.0.1"
-requests = {version = "2.28.0", extras = ["security", "socks"]}
+requests = {version = "2.31.0", extras = ["security", "socks"]}
 pyOpenSSL = "23.0.0"
 pefile = "*"
 dnfile="0.13.0"
@@ -36,7 +36,7 @@ pyzipper = "0.3.5"
 flare-capa = "5.0.0"
 Cython = "0.29.24"
 # pyre2 = "0.3.6" # Dead for python3.11
-Django = "4.1.7"
+Django = "4.1.9"
 SQLAlchemy = "1.4.22"
 SQLAlchemy-Utils = "0.37.8"
 Jinja2 = "^3.1.2"

@@ -1,5 +1,6 @@
 domain_passlist_re = [
     # Certificate Trust Update domains
+    r"^adobe\.com$",
     r"^ocsp\.usertrust\.com$",
     r"\.windows\.com$",
     r"^ocsp\.comodoca\.com$",
@@ -91,6 +92,8 @@ domain_passlist_re = [
     r"mozilla\.org",
     r"mozilla\.com",
     r"office\.net",
+    r"\.data\.microsoft\.com",
+    r"googleapis\.com",
 ]
 
 
@@ -195,4 +198,7 @@ domain_passlist = [
     "statuse.digitalcertvalidation.com",
     "certificates.intel.com",
     "hostonly.hostonly",
+    "adobe.com",
+    "googleapis.com",
+    "data.microsoft.com",
 ]

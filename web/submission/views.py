@@ -366,8 +366,9 @@ def index(request, task_id=None, resubmit_hash=None):
                     details["task_ids"] = task_ids_tmp
                     if web_conf.web_reporting.get("enabled", False) and web_conf.general.get("existent_tasks", False):
                         records = perform_search("target_sha256", hash, search_limit=5)
-                        for record in records or []:
-                            existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
+                        if records:
+                            for record in records or []:
+                                existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
 
         elif task_category == "sample":
             details["service"] = "WebGUI"
@@ -393,9 +394,10 @@ def index(request, task_id=None, resubmit_hash=None):
                 else:
                     if web_conf.general.get("existent_tasks", False):
                         records = perform_search("target_sha256", sha256, search_limit=5)
-                        for record in records:
-                            if record.get("target").get("file", {}).get("sha256"):
-                                existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
+                        if records:
+                            for record in records:
+                                if record.get("target").get("file", {}).get("sha256"):
+                                    existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
                     details["task_ids"] = task_ids_tmp
 
         elif task_category == "static":
@@ -589,9 +591,10 @@ def index(request, task_id=None, resubmit_hash=None):
         if resubmit_hash:
             if web_conf.general.get("existent_tasks", False):
                 records = perform_search("target_sha256", resubmit_hash, search_limit=5)
-                for record in records:
-                    existent_tasks.setdefault(record["target"]["file"]["sha256"], [])
-                    existent_tasks[record["target"]["file"]["sha256"]].append(record)
+                if records:
+                    for record in records:
+                        existent_tasks.setdefault(record["target"]["file"]["sha256"], [])
+                        existent_tasks[record["target"]["file"]["sha256"]].append(record)
 
         return render(
             request,
@@ -639,16 +642,14 @@ def remote_session(request, task_id):
         return render(request, "error.html", {"error": "The specified task doesn't seem to exist."})
 
     machine_status = False
-    label = ""
     session_data = ""
 
     if task.status == "running":
-        machine = db.view_machine(task.machine)
-        label = machine.label
+        machine = db.view_machine_by_label(task.machine)
         guest_ip = machine.ip
         machine_status = True
         session_id = uuid3(NAMESPACE_DNS, task_id).hex[:16]
-        session_data = urlsafe_b64encode(f"{session_id}|{label}|{guest_ip}".encode("utf8")).decode("utf8")
+        session_data = urlsafe_b64encode(f"{session_id}|{task.machine}|{guest_ip}".encode("utf8")).decode("utf8")
 
     return render(
         request,

@@ -11,6 +11,7 @@ __pycache__/
 .env/
 .vscode
 
+.vscode
 env/
 tests/test_objects/
 log/
