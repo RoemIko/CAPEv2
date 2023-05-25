@@ -213,6 +213,7 @@ def get_document_window_click_around(hwnd, lparm):
                 "Acrobat",
                 "Reader",
                 "PDF",
+                "OneNote",
             )
         ):
             USER32.SetForegroundWindow(hwnd)
@@ -277,6 +278,7 @@ def get_document_window(hwnd, lparam):
                 "- Acrobat",
                 "- Reader",
                 "- PDF",
+                "- OneNote",
             )
         ):
             # send ALT+F4 equivalent
@@ -326,6 +328,7 @@ class Human(Auxiliary, Thread):
             if nohuman:
                 return True
             doc = False
+
             if hasattr(self.config, "file_type"):
                 file_type = self.config.file_type
                 file_name = self.config.file_name
@@ -348,6 +351,8 @@ class Human(Auxiliary, Thread):
                 ):
                     doc = True
                 elif "PDF" in file_type or file_name.endswith(".pdf"):
+                    doc = True
+                elif ("Microsoft OneNote" or "OneNote") in file_type or file_name.endswith(".one"):
                     doc = True
 
             USER32.EnumWindows(EnumWindowsProc(getwindowlist), 0)
