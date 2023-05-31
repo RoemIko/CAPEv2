@@ -1,5 +1,7 @@
 domain_passlist_re = [
     # Certificate Trust Update domains
+    r"^[0-9a-fA-F]{1,4}(\.[0-9a-fA-F]{1,4}){31}\.ip6\.arpa$",
+    r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\.in-addr\.arpa$",
     r"^adobe\.com$",
     r"^ocsp\.usertrust\.com$",
     r"\.windows\.com$",
@@ -94,11 +96,13 @@ domain_passlist_re = [
     r"office\.net",
     r"\.data\.microsoft\.com",
     r"googleapis\.com",
+    r"^hostonly\.hostonly$",
 ]
 
 
 domain_passlist = [
     # Certificate Trust Update domains
+    "google.com"
     "ocsp.usertrust.com",
     "windows.com",
     "time.windows.com",
@@ -199,6 +203,8 @@ domain_passlist = [
     "certificates.intel.com",
     "hostonly.hostonly",
     "adobe.com",
-    "googleapis.com",
+    "update.googleapis.com",
     "data.microsoft.com",
+    "google.com",
+    "cc-api-data.adobe.io",
 ]
