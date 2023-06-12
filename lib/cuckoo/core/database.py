@@ -1546,6 +1546,8 @@ class Database(object, metaclass=Singleton):
             timeout = 0
         if not priority:
             priority = 1
+        if file_path.endswith((".htm", ".html")) and not package:
+            package = web_conf.url_analysis.package
 
         return self.add(
             File(file_path),
@@ -1588,7 +1590,7 @@ class Database(object, metaclass=Singleton):
 
         if tmp_package and tmp_package in sandbox_packages:
             # This probably should be way much bigger list of formats
-            if tmp_package == ("iso", "udf", "vhd"):
+            if tmp_package in ("iso", "udf", "vhd"):
                 package = "archive"
             elif tmp_package in ("zip", "rar"):
                 package = ""
@@ -1977,7 +1979,7 @@ class Database(object, metaclass=Singleton):
 
             # All other task types have a "target" pointing to a temp location,
             # so get a stable path "target" based on the sample hash.
-            paths = self.sample_path_by_hash(task.sample.sha256)
+            paths = self.sample_path_by_hash(task.sample.sha256, task_id)
             paths = [file_path for file_path in paths if path_exists(file_path)]
             if not paths:
                 return None

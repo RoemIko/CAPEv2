@@ -23,7 +23,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get install libxml2-dev libxslt-dev python3-dev libgeoip-dev ssdeep libfuzzy-dev libvirt-dev
+          sudo apt-get install libxml2-dev libxslt-dev python3-dev libgeoip-dev ssdeep libfuzzy-dev
 
       - name: Install Poetry
         uses: snok/install-poetry@v1
@@ -48,7 +48,6 @@ jobs:
         run: |
           sudo bash ./installer/cape2.sh yara
           cd $GITHUB_WORKSPACE
-          sudo rm -r /tmp/yara-python
           bash -c "poetry run ./extra/poetry_yara_installer.sh"
 
       - name: Run unit tests
