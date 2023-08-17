@@ -1,5 +1,4 @@
 import concurrent.futures
-import contextlib
 import functools
 import hashlib
 import json
@@ -7,15 +6,21 @@ import logging
 import os
 import shlex
 import shutil
+import signal
 import subprocess
-import tempfile
-import timeit
-from typing import DefaultDict, List, Optional, Set, TypedDict
+from typing import DefaultDict, List, Optional, Set, Union
 
 import pebble
 
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
+from lib.cuckoo.common.integrations.file_extra_info_modules import (
+    ExtractorReturnType,
+    SuccessfulExtractionReturnType,
+    collect_extracted_filenames,
+    extractor_ctx,
+    time_tracker,
+)
 from lib.cuckoo.common.integrations.parse_dotnet import DotNETExecutable
 from lib.cuckoo.common.integrations.parse_java import Java
 from lib.cuckoo.common.integrations.parse_lnk import LnkShortcut
@@ -25,18 +30,11 @@ from lib.cuckoo.common.integrations.parse_office import HAVE_OLETOOLS, Office
 from lib.cuckoo.common.integrations.parse_pdf import PDF
 from lib.cuckoo.common.integrations.parse_pe import HAVE_PEFILE, PortableExecutable
 from lib.cuckoo.common.integrations.parse_wsf import WindowsScriptFile  # EncodedScriptFile
-from lib.cuckoo.common.objects import File
-from lib.cuckoo.common.path_utils import (
-    path_exists,
-    path_get_size,
-    path_is_file,
-    path_mkdir,
-    path_object,
-    path_read_file,
-    path_write_file,
-)
 
 # from lib.cuckoo.common.integrations.parse_elf import ELF
+from lib.cuckoo.common.load_extra_modules import file_extra_info_load_modules
+from lib.cuckoo.common.objects import File
+from lib.cuckoo.common.path_utils import path_exists, path_get_size, path_is_file, path_mkdir, path_read_file, path_write_file
 from lib.cuckoo.common.utils import get_options, is_text_file
 
 try:
@@ -56,40 +54,14 @@ except ImportError:
 DuplicatesType = DefaultDict[str, Set[str]]
 
 
-@contextlib.contextmanager
-def extractor_ctx(filepath, tool_name, prefix=None):
-    tempdir = tempfile.mkdtemp(prefix=prefix)
-    retval = {"tempdir": tempdir}
-    try:
-        yield retval
-    except subprocess.CalledProcessError as err:
-        log.error(
-            "%s: Failed to extract files from %s: cmd=`%s`, stdout=`%s`, stderr=`%s`",
-            tool_name,
-            filepath,
-            shlex.join(err.cmd),
-            err.stdout,
-            err.stderr,
-        )
-    except Exception:
-        log.exception("Exception was raised while attempting to use %s on %s", tool_name, filepath)
-    else:
-        if retval.get("extracted_files", []):
-            retval["tool_name"] = tool_name
-        else:
-            retval.pop("extracted_files", None)
-
-
-class SuccessfulExtractionReturnType(TypedDict, total=False):
-    tempdir: str
-    extracted_files: List[str]
-    tool_name: str
-
-
-ExtractorReturnType = Optional[SuccessfulExtractionReturnType]
-
 processing_conf = Config("processing")
 selfextract_conf = Config("selfextract")
+
+try:
+    from modules.signatures.recon_checkip import dns_indicators
+except ImportError:
+    dns_indicators = ()
+
 
 HAVE_FLARE_CAPA = False
 # required to not load not enabled dependencies
@@ -136,15 +108,16 @@ if processing_conf.trid.enabled:
     trid_binary = os.path.join(CUCKOO_ROOT, processing_conf.trid.identifier)
     definitions = os.path.join(CUCKOO_ROOT, processing_conf.trid.definitions)
 
+extra_info_modules = file_extra_info_load_modules(CUCKOO_ROOT)
+
 HAVE_STRINGS = False
-HAVE_DNFILE = False
 if processing_conf.strings.enabled and not processing_conf.strings.on_demand:
     from lib.cuckoo.common.integrations.strings import extract_strings
 
     HAVE_STRINGS = True
 
     if processing_conf.strings.dotnet:
-        from lib.cuckoo.common.dotnet_utils import HAVE_DNFILE, dotnet_user_strings
+        from lib.cuckoo.common.dotnet_utils import dotnet_user_strings
 
 HAVE_VIRUSTOTAL = False
 if processing_conf.virustotal.enabled and not processing_conf.virustotal.on_demand:
@@ -196,10 +169,11 @@ def static_file_info(
         if "Mono" in data_dictionary["type"]:
             if selfextract_conf.general.dotnet:
                 data_dictionary["dotnet"] = DotNETExecutable(file_path).run()
-            if HAVE_DNFILE:
-                dotnet_strings = dotnet_user_strings(file_path)
-                if dotnet_strings:
-                    data_dictionary.setdefault("dotnet_strings", dotnet_strings)
+                if processing_conf.strings.dotnet:
+                    dotnet_strings = dotnet_user_strings(file_path)
+                    if dotnet_strings:
+                        data_dictionary.setdefault("dotnet_strings", dotnet_strings)
+
     elif HAVE_OLETOOLS and package in {"doc", "ppt", "xls", "pub"} and selfextract_conf.general.office:
         # options is dict where we need to get pass get_options
         data_dictionary["office"] = Office(file_path, task_id, data_dictionary["sha256"], options_dict).run()
@@ -373,28 +347,24 @@ def _extracted_files_metadata(
     return metadata
 
 
-def collect_extracted_filenames(tempdir):
-    """Gather a list of files relative to the given directory."""
-    extracted_files = []
-    for root, _, files in os.walk(tempdir):
-        for file in files:
-            path = path_object(os.path.join(root, file))
-            if path.is_file():
-                extracted_files.append(str(path.relative_to(tempdir)))
-    return extracted_files
+def pass_signal(proc, signum, frame):
+    proc.send_signal(signum)
 
 
-def time_tracker(func):
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        time_start = timeit.default_timer()
-        result = func(*args, **kwargs)
-        return {
-            "result": result,
-            "took_seconds": timeit.default_timer() - time_start,
-        }
-
-    return wrapped
+def run_tool(*args, **kwargs) -> Union[bytes, str]:
+    """Start a subprocess to run the given tool. Make sure to pass a SIGTERM signal to
+    that process if it is received.
+    """
+    kwargs["stdout"] = subprocess.PIPE
+    old_handler = None
+    try:
+        proc = subprocess.Popen(*args, **kwargs)
+        old_handler = signal.signal(signal.SIGTERM, functools.partial(pass_signal, proc))
+        (stdout, stderr) = proc.communicate()
+        return stdout
+    finally:
+        if old_handler:
+            signal.signal(signal.SIGTERM, old_handler)
 
 
 def generic_file_extractors(
@@ -430,30 +400,40 @@ def generic_file_extractors(
         "tests": tests,
     }
 
+    file_info_funcs = [
+        msi_extract,
+        kixtart_extract,
+        vbe_extract,
+        batch_extract,
+        UnAutoIt_extract,
+        UPX_unpack,
+        RarSFX_extract,
+        Inno_extract,
+        SevenZip_unpack,
+        de4dot_deobfuscate,
+        eziriz_deobfuscate,
+        office_one,
+        msix_extract,
+    ]
+
     futures = {}
     with pebble.ProcessPool(max_workers=int(selfextract_conf.general.max_workers)) as pool:
-        for extraction_func in (
-            msi_extract,
-            kixtart_extract,
-            vbe_extract,
-            batch_extract,
-            UnAutoIt_extract,
-            UPX_unpack,
-            RarSFX_extract,
-            Inno_extract,
-            SevenZip_unpack,
-            de4dot_deobfuscate,
-            eziriz_deobfuscate,
-            office_one,
-            msix_extract,
-        ):
-            funcname = extraction_func.__name__
-            if not getattr(selfextract_conf, funcname, {}).get("enabled", False):
+        for extraction_func in file_info_funcs:
+            funcname = extraction_func.__name__.split(".")[-1]
+            if (
+                not getattr(selfextract_conf, funcname, {}).get("enabled", False)
+                and getattr(extraction_func, "enabled", False) is False
+            ):
                 continue
 
-            func_timeout = int(getattr(selfextract_conf, funcname).get("timeout", 60))
+            func_timeout = int(getattr(selfextract_conf, funcname, {}).get("timeout", 60))
             futures[funcname] = pool.schedule(extraction_func, args=args, kwargs=kwargs, timeout=func_timeout)
 
+        if extra_info_modules:
+            for module in extra_info_modules:
+                func_timeout = int(getattr(module, "timeout", 60))
+                funcname = module.__name__.split(".")[-1]
+                futures[funcname] = pool.schedule(module.extract_details, args=args, kwargs=kwargs, timeout=func_timeout)
     pool.join()
 
     for funcname, future in futures.items():
@@ -590,7 +570,7 @@ def eziriz_deobfuscate(file: str, *, data_dictionary: dict, **_) -> ExtractorRet
     with extractor_ctx(file, "eziriz", prefix="eziriz_") as ctx:
         tempdir = ctx["tempdir"]
         dest_path = os.path.join(tempdir, os.path.basename(file))
-        _ = subprocess.check_output(
+        _ = run_tool(
             [
                 os.path.join(CUCKOO_ROOT, binary),
                 *shlex.split(selfextract_conf.eziriz_deobfuscate.extra_args.strip()),
@@ -623,7 +603,7 @@ def de4dot_deobfuscate(file: str, *, filetype: str, **_) -> ExtractorReturnType:
     with extractor_ctx(file, "de4dot", prefix="de4dot_") as ctx:
         tempdir = ctx["tempdir"]
         dest_path = os.path.join(tempdir, os.path.basename(file))
-        _ = subprocess.check_output(
+        _ = run_tool(
             [
                 binary,
                 *shlex.split(selfextract_conf.de4dot_deobfuscate.extra_args.strip()),
@@ -654,7 +634,7 @@ def msi_extract(file: str, *, filetype: str, **kwargs) -> ExtractorReturnType:
         output = False
         if not kwargs.get("tests"):
             # msiextract in different way that 7z, we need to add subfolder support
-            output = subprocess.check_output(
+            output = run_tool(
                 [selfextract_conf.msi_extract.binary, file, "--directory", tempdir],
                 universal_newlines=True,
                 stderr=subprocess.PIPE,
@@ -666,7 +646,7 @@ def msi_extract(file: str, *, filetype: str, **kwargs) -> ExtractorReturnType:
                 if path_is_file(os.path.join(tempdir, extracted_file))
             ]
         else:
-            output = subprocess.check_output(
+            output = run_tool(
                 [
                     "7z",
                     "e",
@@ -701,7 +681,7 @@ def Inno_extract(file: str, *, data_dictionary: dict, **_) -> ExtractorReturnTyp
 
     with extractor_ctx(file, "InnoExtract", prefix="innoextract_") as ctx:
         tempdir = ctx["tempdir"]
-        subprocess.check_output(
+        run_tool(
             [selfextract_conf.Inno_extract.binary, file, "--output-dir", tempdir],
             universal_newlines=True,
             stderr=subprocess.PIPE,
@@ -746,7 +726,7 @@ def UnAutoIt_extract(file: str, *, data_dictionary: dict, **_) -> ExtractorRetur
 
     with extractor_ctx(file, "UnAutoIt", prefix="unautoit_") as ctx:
         tempdir = ctx["tempdir"]
-        output = subprocess.check_output(
+        output = run_tool(
             [unautoit_binary, "extract-all", "--output-dir", tempdir, file],
             universal_newlines=True,
             stderr=subprocess.PIPE,
@@ -769,7 +749,7 @@ def UPX_unpack(file: str, *, filetype: str, data_dictionary: dict, **_) -> Extra
     with extractor_ctx(file, "UnUPX", prefix="unupx_") as ctx:
         basename = f"{os.path.basename(file)}_unpacked"
         dest_path = os.path.join(ctx["tempdir"], basename)
-        output = subprocess.check_output(
+        output = run_tool(
             [
                 "upx",
                 "-d",
@@ -843,7 +823,7 @@ def SevenZip_unpack(file: str, *, filetype: str, data_dictionary: dict, options:
             for child in unpacked.children:
                 _ = path_write_file(os.path.join(tempdir, child.filename.decode()), child.contents)
         else:
-            _ = subprocess.check_output(
+            _ = run_tool(
                 [
                     "7z",
                     "e",
@@ -878,7 +858,7 @@ def RarSFX_extract(file, *, data_dictionary, options: dict, **_) -> ExtractorRet
     with extractor_ctx(file, "UnRarSFX", prefix="unrar_") as ctx:
         tempdir = ctx["tempdir"]
         password = options.get("password", "infected")
-        output = subprocess.check_output(
+        output = run_tool(
             ["/usr/bin/unrar", "e", "-kb", f"-p{password}", file, tempdir],
             universal_newlines=True,
             stderr=subprocess.PIPE,
@@ -927,7 +907,7 @@ def msix_extract(file: str, *, data_dictionary: dict, **_) -> ExtractorReturnTyp
             for child in unpacked.children:
                 _ = path_write_file(os.path.join(tempdir, child.filename.decode()), child.contents)
         else:
-            _ = subprocess.check_output(
+            _ = run_tool(
                 [
                     "unzip",
                     file,

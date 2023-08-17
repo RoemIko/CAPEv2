@@ -11,7 +11,7 @@ import timeit
 try:
     # Azure-specific imports
     # pip install azure-identity msrest msrestazure azure-mgmt-compute azure-mgmt-network
-    from azure.identity import ClientSecretCredential
+    from azure.identity import CertificateCredential, ClientSecretCredential
     from azure.mgmt.compute import ComputeManagementClient, models
     from azure.mgmt.network import NetworkManagementClient
     from msrest.polling import LROPoller
@@ -183,13 +183,24 @@ class Azure(Machinery):
         @return: an Azure ClientSecretCredential object
         """
 
-        # Instantiates the ClientSecretCredential object using
-        # Azure client ID, secret and Azure tenant ID
-        credentials = ClientSecretCredential(
-            client_id=self.options.az.client_id,
-            client_secret=self.options.az.secret,
-            tenant_id=self.options.az.tenant,
-        )
+        credentials = None
+        if self.options.az.secret and self.options.az.secret != "<secret>":
+            # Instantiates the ClientSecretCredential object using
+            # Azure client ID, secret and Azure tenant ID
+            credentials = ClientSecretCredential(
+                client_id=self.options.az.client_id,
+                client_secret=self.options.az.secret,
+                tenant_id=self.options.az.tenant,
+            )
+        else:
+            # Instantiates the CertificateCredential object using
+            # Azure client ID, secret and Azure tenant ID
+            credentials = CertificateCredential(
+                client_id=self.options.az.client_id,
+                tenant_id=self.options.az.tenant,
+                certificate_path=self.options.az.certificate_path,
+                password=self.options.az.certificate_password,
+            )
         return credentials
 
     def _thr_refresh_clients(self):
@@ -329,7 +340,7 @@ class Azure(Machinery):
                         operation=self.compute_client.virtual_machine_scale_sets.begin_update,
                     )
                     _ = self._handle_poller_result(update_vmss_image)
-            else:
+            elif not self.options.az.multiple_capes_in_sandbox_rg:
                 # VMSS does not have the required name but has the tag that we associate with being a
                 # correct VMSS
                 Azure._azure_api_call(
@@ -350,28 +361,6 @@ class Azure(Machinery):
                 f"Subnet '{self.options.az.subnet}' does not exist in Virtual Network '{self.options.az.vnet}'"
             )
 
-        # Create required VMSSs that don't exist yet
-        vmss_creation_threads = []
-        vmss_reimage_threads = []
-        for vmss, vals in self.required_vmsss.items():
-            if vals["exists"] and not self.options.az.just_start:
-                # Reimage VMSS!
-                thr = threading.Thread(
-                    target=self._thr_reimage_vmss,
-                    args=(vmss,),
-                )
-                vmss_reimage_threads.append(thr)
-                thr.start()
-            else:
-                # Create VMSS!
-                thr = threading.Thread(target=self._thr_create_vmss, args=(vmss, vals["image"], vals["platform"]))
-                vmss_creation_threads.append(thr)
-                thr.start()
-
-        # Wait for everything to complete!
-        for thr in vmss_reimage_threads + vmss_creation_threads:
-            thr.join()
-
         # Initialize the platform scaling state monitor
         is_platform_scaling = {Azure.WINDOWS_PLATFORM: False, Azure.LINUX_PLATFORM: False}
 
@@ -379,7 +368,6 @@ class Azure(Machinery):
         # If we want to programmatically determine the number of cores for the sku
         if self.options.az.find_number_of_cores_for_sku or self.options.az.instance_type_cores == 0:
             resource_skus = Azure._azure_api_call(
-                self.options.az.region_name,
                 filter=f"location={self.options.az.region_name}",
                 operation=self.compute_client.resource_skus.list,
             )
@@ -402,6 +390,31 @@ class Azure(Machinery):
         # Do not programmatically determine the number of cores for the sku
         else:
             self.instance_type_cpus = self.options.az.instance_type_cores
+
+        # Create required VMSSs that don't exist yet
+        vmss_creation_threads = []
+        vmss_reimage_threads = []
+        for vmss, vals in self.required_vmsss.items():
+            if vals["exists"] and not self.options.az.just_start:
+                if machine_pools[vmss]["size"] == 0:
+                    self._thr_scale_machine_pool(self.options.az.scale_sets[vmss].pool_tag, True if vals["platform"] else False),
+                else:
+                    # Reimage VMSS!
+                    thr = threading.Thread(
+                        target=self._thr_reimage_vmss,
+                        args=(vmss,),
+                    )
+                    vmss_reimage_threads.append(thr)
+                    thr.start()
+            else:
+                # Create VMSS!
+                thr = threading.Thread(target=self._thr_create_vmss, args=(vmss, vals["image"], vals["platform"]))
+                vmss_creation_threads.append(thr)
+                thr.start()
+
+        # Wait for everything to complete!
+        for thr in vmss_reimage_threads + vmss_creation_threads:
+            thr.join()
 
         # Initialize the batch reimage threads. We want at most 4 batch reimaging threads
         # so that if no VMSS scaling or batch deleting is taking place (aka we are receiving constant throughput of
@@ -682,20 +695,14 @@ class Azure(Machinery):
         # I figured this was the most concrete way to guarantee that an API method was being passed
         if not kwargs["operation"]:
             raise Exception("kwargs in _azure_api_call requires 'operation' parameter.")
-        operation = kwargs["operation"]
+        operation = kwargs.pop("operation")
 
         # This is used for logging
-        api_call = f"{operation}({args})"
-
-        # Note that we are using a custom polling interval for some operations
-        polling_interval = kwargs.get("polling_interval")
+        api_call = f"{operation}({args},{kwargs})"
 
         try:
             log.debug(f"Trying {api_call}")
-            if polling_interval:
-                results = operation(*args, polling_interval=polling_interval)
-            else:
-                results = operation(*args)
+            results = operation(*args, **kwargs)
         except Exception as exc:
             # For ClientRequestErrors, they do not have the attribute 'error'
             error = exc.error.error if getattr(exc, "error", False) else exc
@@ -742,7 +749,7 @@ class Azure(Machinery):
             os_disk=vmss_os_disk,
         )
         vmss_dns_settings = models.VirtualMachineScaleSetNetworkConfigurationDnsSettings(
-            dns_servers=[self.options.az.dns_server_ip]
+            dns_servers=self.options.az.dns_server_ips.strip().split(",")
         )
         vmss_ip_config = models.VirtualMachineScaleSetIPConfiguration(
             name="vmss_ip_config",

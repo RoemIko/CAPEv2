@@ -39,7 +39,7 @@ from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.utils import free_space_monitor
 from lib.cuckoo.core.database import TASK_COMPLETED, TASK_FAILED_PROCESSING, TASK_REPORTED, Database, Task
 from lib.cuckoo.core.plugins import RunProcessing, RunReporting, RunSignatures
-from lib.cuckoo.core.startup import ConsoleHandler, check_linux_dist, init_modules, init_yara
+from lib.cuckoo.core.startup import ConsoleHandler, check_linux_dist, init_modules
 
 cfg = Config()
 logconf = Config("logging")
@@ -441,7 +441,6 @@ def main():
     )
     args = parser.parse_args()
 
-    init_yara()
     init_modules()
     if args.id == "auto":
         if not logconf.logger.process_per_task_log:
@@ -481,7 +480,7 @@ def main():
                             if args.json_report and path_exists(args.json_report):
                                 report = args.json_report
                             else:
-                                sys.exit(f"File {report} doest exist")
+                                sys.exit(f"File {report} does not exist")
                         if report:
                             results = json.load(open(report))
                     if results is not None:
@@ -489,6 +488,9 @@ def main():
                         if "statistics" not in results:
                             results["statistics"] = {"signatures": []}
                         RunSignatures(task=task.to_dict(), results=results).run(args.signature_name)
+                        # If you are only running a single signature, print that output
+                        if args.signature_name and results["signatures"]:
+                            print(results["signatures"][0])
                 else:
                     process(
                         task=task,

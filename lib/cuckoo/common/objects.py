@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict
 
+from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.defines import (
     PAGE_EXECUTE,
     PAGE_EXECUTE_READ,
@@ -26,6 +27,7 @@ from lib.cuckoo.common.defines import (
     PAGE_WRITECOPY,
 )
 from lib.cuckoo.common.integrations.parse_pe import IMAGE_FILE_MACHINE_AMD64, IsPEImage
+from lib.cuckoo.common.path_utils import path_exists
 
 try:
     import magic
@@ -67,6 +69,14 @@ try:
 except ImportError:
     print("Missed dependency: pip3 install python-tlsh")
     HAVE_TLSH = False
+
+try:
+    import yara
+
+    HAVE_YARA = True
+except ImportError:
+    HAVE_YARA = False
+
 
 log = logging.getLogger(__name__)
 
@@ -330,9 +340,14 @@ class File:
         file_type = None
         if self.path_object.exists():
             if HAVE_MAGIC:
+                fn = False
+                if hasattr(magic, "detect_from_filename"):
+                    fn = magic.detect_from_filename
                 if hasattr(magic, "from_file"):
+                    fn = magic.from_file
+                if fn:
                     try:
-                        file_type = magic.from_file(self.file_path_ansii)
+                        file_type = fn(self.file_path_ansii)
                     except Exception as e:
                         log.error(e, exc_info=True)
                 if not file_type and hasattr(magic, "open"):
@@ -406,6 +421,8 @@ class File:
 
     def _yara_encode_string(self, yara_string):
         # Beware, spaghetti code ahead.
+        if not isinstance(yara_string, bytes):
+            return yara_string
         try:
             new = yara_string.decode()
         except UnicodeDecodeError:
@@ -416,10 +433,87 @@ class File:
 
         return new
 
+    @classmethod
+    def init_yara(self):
+        """Generates index for yara signatures."""
+
+        categories = ("binaries", "urls", "memory", "CAPE", "macro", "monitor")
+
+        log.debug("Initializing Yara...")
+
+        # Generate root directory for yara rules.
+        yara_root = os.path.join(CUCKOO_ROOT, "data", "yara")
+
+        # Loop through all categories.
+        for category in categories:
+            # Check if there is a directory for the given category.
+            category_root = os.path.join(yara_root, category)
+            if not path_exists(category_root):
+                log.warning("Missing Yara directory: %s?", category_root)
+                continue
+
+            rules, indexed = {}, []
+            for category_root, _, filenames in os.walk(category_root, followlinks=True):
+                for filename in filenames:
+                    if not filename.endswith((".yar", ".yara")):
+                        continue
+                    filepath = os.path.join(category_root, filename)
+                    rules[f"rule_{category}_{len(rules)}"] = filepath
+                    indexed.append(filename)
+
+                # Need to define each external variable that will be used in the
+            # future. Otherwise Yara will complain.
+            externals = {"filename": ""}
+
+            while True:
+                try:
+                    File.yara_rules[category] = yara.compile(filepaths=rules, externals=externals)
+                    File.yara_initialized = True
+                    break
+                except yara.SyntaxError as e:
+                    bad_rule = f"{str(e).split('.yar', 1)[0]}.yar"
+                    log.debug(
+                        "Trying to disable rule: %s. Can't compile it. Ensure that your YARA is properly installed.", bad_rule
+                    )
+                    if os.path.basename(bad_rule) not in indexed:
+                        break
+                    for k, v in rules.items():
+                        if v == bad_rule:
+                            del rules[k]
+                            indexed.remove(os.path.basename(bad_rule))
+                            log.error("Can't compile YARA rule: %s. Maybe is bad yara but can be missing YARA's module.", bad_rule)
+                            break
+                except yara.Error as e:
+                    log.error("There was a syntax error in one or more Yara rules: %s", e)
+                    break
+            if category == "memory":
+                try:
+                    mem_rules = yara.compile(filepaths=rules, externals=externals)
+                    mem_rules.save(os.path.join(yara_root, "index_memory.yarc"))
+                except yara.Error as e:
+                    if "could not open file" in str(e):
+                        log.inf("Can't write index_memory.yarc. Did you starting it with correct user?")
+                    else:
+                        log.error(e)
+
+            indexed = sorted(indexed)
+            for entry in indexed:
+                if (category, entry) == indexed[-1]:
+                    log.debug("\t `-- %s %s", category, entry)
+                else:
+                    log.debug("\t |-- %s %s", category, entry)
+
     def get_yara(self, category="binaries", externals=None):
         """Get Yara signatures matches.
         @return: matched Yara signatures.
         """
+        if float(yara.__version__[:-2]) < 4.3:
+            log.error("You using outdated YARA version. run: poetry install")
+            return []
+
+        if not File.yara_initialized:
+            File.init_yara()
+
         results = []
         if not os.path.getsize(self.file_path):
             return results
@@ -427,13 +521,17 @@ class File:
         try:
             results, rule = [], File.yara_rules[category]
             for match in rule.match(self.file_path_ansii, externals=externals):
-                strings = {self._yara_encode_string(s[2]) for s in match.strings}
-                addresses = {s[1].strip("$"): s[0] for s in match.strings}
+                strings = []
+                addresses = {}
+                for yara_string in match.strings:
+                    for x in yara_string.instances:
+                        strings.extend({self._yara_encode_string(x.matched_data)})
+                        addresses.update({yara_string.identifier.strip("$"): x.offset})
                 results.append(
                     {
                         "name": match.rule,
                         "meta": match.meta,
-                        "strings": list(strings),
+                        "strings": strings,
                         "addresses": addresses,
                     }
                 )

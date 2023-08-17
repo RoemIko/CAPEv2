@@ -52,7 +52,7 @@ librenms_megaraid_enable=0
 # disabling this will result in the web interface being disabled
 MONGO_ENABLE=1
 
-DIE_VERSION="3.07"
+DIE_VERSION="3.08"
 
 TOR_SOCKET_TIMEOUT="60"
 
@@ -735,21 +735,29 @@ function install_yara() {
     git clone --recursive https://github.com/VirusTotal/yara-python
     cd yara-python
     # checkout tag v4.2.3 to work around broken master branch
-    git checkout tags/v4.2.3
+    # git checkout tags/v4.2.3
     # sometimes it requires to have a copy of YARA inside of yara-python for proper compilation
     # git clone --recursive https://github.com/VirusTotal/yara
     # Temp workarond to fix issues compiling yara-python https://github.com/VirusTotal/yara-python/issues/212
     # partially applying PR https://github.com/VirusTotal/yara-python/pull/210/files
-    sed -i "191 i \ \ \ \ # Needed to build tlsh'\n    module.define_macros.extend([('BUCKETS_128', 1), ('CHECKSUM_1B', 1)])\n    # Needed to build authenticode parser\n    module.libraries.append('ssl')" setup.py
-    python3 setup.py build --enable-cuckoo --enable-magic --enable-profiling --enable-dotnet
+    # sed -i "191 i \ \ \ \ # Needed to build tlsh'\n    module.define_macros.extend([('BUCKETS_128', 1), ('CHECKSUM_1B', 1)])\n    # Needed to build authenticode parser\n    module.libraries.append('ssl')" setup.py
+    python3 setup.py build --enable-cuckoo --enable-magic --enable-profiling
     cd ..
     # for root
     pip3 install ./yara-python
+    if [ -d yara-python ]; then
+        rm -r yara-python
+    fi
 
-    # Remove the yara-python directory after installing it to avoid permission issues if
-    # `cd /opt/CAPEv2/ ; sudo -u cape poetry run extra/poetry_yara_installer.sh`
-    #needs to be ran again
-    rm -r yara-python
+    if id "cape" >/dev/null 2>&1; then
+        cd /opt/CAPEv2/
+        sudo -u cape poetry run extra/poetry_yara_installer.sh
+        cd -
+    fi
+    if [ -d yara-python ]; then
+        rm -r yara-python
+    fi
+
 }
 
 function install_mongo(){
@@ -810,7 +818,7 @@ Group=mongodb
 # StandardOutput=syslog
 # StandardError=syslog
 SyslogIdentifier=mongodb
-LimitNOFILE=65536
+LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -924,10 +932,8 @@ function dependencies() {
         useradd --system -g ${USER} -d /home/${USER}/ -m ${USER} --shell /bin/bash
     fi
 
-    groupadd pcap
-    usermod -a -G pcap ${USER}
-    chgrp pcap ${TCPDUMP_PATH}
-    setcap cap_net_raw,cap_net_admin=eip ${TCPDUMP_PATH}
+    echo "${USER} ALL=NOPASSWD: ${TCPDUMP_PATH}" > /etc/sudoers.d/tcpdump
+    chmod 440 /etc/sudoers.d/tcpdump
 
     usermod -a -G systemd-journal ${USER}
 
@@ -1016,6 +1022,8 @@ EOF
     sudo checkinstall -D --pkgname=passivedns --default
 
     pip3 install unicorn capstone
+
+    sed -i 's/APT::Periodic::Unattended-Upgrade "1";/APT::Periodic::Unattended-Upgrade "0";/g' /etc/apt/apt.conf.d/20auto-upgrades
 
 }
 
@@ -1285,6 +1293,10 @@ function install_guacamole() {
 
     pip3 install -U 'Twisted[tls,http2]'
 
+    if [ -f "/etc/systemd/system/guacd.service" ] ; then
+        sudo rm /etc/systemd/system/guacd.service
+    fi
+
     if [ ! -f "/opt/lib/systemd/system/guac-web.service" ] ; then
         cp /opt/CAPEv2/systemd/guacd.service /lib/systemd/system/guacd.service
         cp /opt/CAPEv2/systemd/guac-web.service /lib/systemd/system/guac-web.service
@@ -1306,8 +1318,6 @@ function install_guacamole() {
     sudo -u ${USER} bash -c 'export PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring; poetry install'
     cd ..
 
-    sudo mount -a
-
     systemctl daemon-reload
     systemctl enable guacd.service guac-web.service
     systemctl start guacd.service guac-web.service
@@ -1315,8 +1325,7 @@ function install_guacamole() {
 
 function install_DIE() {
     apt install libqt5opengl5 libqt5script5 libqt5scripttools5 libqt5sql5 -y
-    wget "https://github.com/horsicq/DIE-engine/releases/download/${DIE_VERSION}/die_${DIE_VERSION}_Ubuntu_${UBUNTU_VERSION}_amd64.deb" -O DIE.deb
-    dpkg -i DIE.deb
+    wget "https://github.com/horsicq/DIE-engine/releases/download/${DIE_VERSION}/die_${DIE_VERSION}_Ubuntu_${UBUNTU_VERSION}_amd64.deb" -O DIE.deb && dpkg -i DIE.deb
 }
 
 # Doesn't work ${$1,,}

@@ -476,17 +476,70 @@ def fix_section_permission(path):
         log.info(e)
 
 
-# Submission hooks to set options based on some naming patterns
-def recon(filename, orig_options, timeout, enforce_timeout):
-    filename = filename.lower()
+# Submission hooks to manipulate arguments of tasks execution
+def recon(
+    filename,
+    orig_options,
+    timeout,
+    enforce_timeout,
+    package,
+    tags,
+    static,
+    priority,
+    machine,
+    platform,
+    custom,
+    memory,
+    clock,
+    unique,
+    referrer,
+    tlp,
+    tags_tasks,
+    route,
+    cape,
+):
     if not isinstance(filename, str):
         filename = bytes2str(filename)
-    if "name" in filename:
+
+    if web_cfg.general.yara_recon:
+        hits = File(filename).get_yara("binaries")
+        for hit in hits:
+            cape_name = hit["meta"].get("cape_type", "")
+            if not cape_name.endswith(("Crypter", "Packer", "Obfuscator", "Loader")):
+                continue
+
+            parsed_options = get_options(hit["meta"].get("cape_options", ""))
+            if "tags" in parsed_options:
+                tags = "," + parsed_options["tags"] if tags else parsed_options["tags"]
+            # custom packages should be added to lib/cuckoo/core/database.py -> sandbox_packages list
+            if "package" in parsed_options:
+                package = parsed_options["package"]
+
+    if "name" in filename.lower():
         orig_options += ",timeout=400,enforce_timeout=1,procmemdump=1,procdump=1"
         timeout = 400
         enforce_timeout = True
 
-    return orig_options, timeout, enforce_timeout
+    return (
+        static,
+        priority,
+        machine,
+        platform,
+        custom,
+        memory,
+        clock,
+        unique,
+        referrer,
+        tlp,
+        tags_tasks,
+        route,
+        cape,
+        orig_options,
+        timeout,
+        enforce_timeout,
+        package,
+        tags,
+    )
 
 
 def get_magic_type(data):
@@ -652,7 +705,47 @@ def download_file(**kwargs):
         if len(kwargs["request"].FILES) == 1:
             return "error", {"error": "Sorry no x64 support yet"}
 
-    kwargs["options"], timeout, enforce_timeout = recon(kwargs["path"], kwargs["options"], timeout, enforce_timeout)
+    (
+        static,
+        priority,
+        machine,
+        platform,
+        custom,
+        memory,
+        clock,
+        unique,
+        referrer,
+        tlp,
+        tags_tasks,
+        route,
+        cape,
+        kwargs["options"],
+        timeout,
+        enforce_timeout,
+        package,
+        tags,
+    ) = recon(
+        kwargs["path"],
+        kwargs["options"],
+        timeout,
+        enforce_timeout,
+        package,
+        tags,
+        static,
+        priority,
+        machine,
+        platform,
+        custom,
+        memory,
+        clock,
+        unique,
+        referrer,
+        tlp,
+        tags_tasks,
+        route,
+        cape,
+    )
+
     if not kwargs.get("task_machines", []):
         kwargs["task_machines"] = [None]
 
@@ -1102,7 +1195,7 @@ def force_int(value):
 
 
 def force_bool(value):
-    if type(value) == bool:
+    if isinstance(value, bool):
         return value
 
     if not value:
@@ -1144,7 +1237,7 @@ def parse_request_arguments(request, keyword="POST"):
     unique = force_bool(getattr(request, keyword).get("unique", False))
     tlp = getattr(request, keyword).get("tlp")
     lin_options = getattr(request, keyword).get("lin_options", "")
-    route = getattr(request, keyword).get("route")
+    route = getattr(request, keyword).get("route", "")
     cape = getattr(request, keyword).get("cape", "")
 
     if referrer:

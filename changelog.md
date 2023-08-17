@@ -1,3 +1,77 @@
+### [16.8.2023]
+* Monitor updates:
+    * Filter uninteresting process dumps via new VerifyCodeSection() function checking code section for modification
+    * Fix issue with process path-based options being set too late (after yara init)
+
+### [10.8.2023]
+* Monitor updates:
+    * Fix for NtQueueApcThread hook: do not send thread handle in 'process' message
+    * Add WmiPrvSE.exe to services hookset to fix Win10 WMI/interop detonation issues
+
+### [8.8.2023]
+* Minimal YARA version now is 4.3.1
+* `file_extra_info` modules autoload, see example in `lib/cuckoo/common/file_extra_info_modules`
+* Initial compatibility with x64 python version in guests.
+* In `agent.py` add `is_admin` value.
+
+### [5.8.2023]
+* New anti-direct-syscall feature: 'syscall breakpoints' (64-bit only)
+    * redirect syscalls back through traditional hooks
+    * via monitor yara & updated monitor
+* Monitor updates:
+    * Unpacker: add dumping of decrypted PEs from CryptDecrypt(), NCryptDecrypt(), BCryptDecrypt()
+    * NtOpenProcessToken, NtQueryInformationToken, RtlWow64GetThreadContext hooks
+    * Syscall breakpoint implementation (64-bit)
+    * Fix hook issues with NtQueueApcThread, GetWriteWatch
+    * Misc fixes & improvements (see capemon repo for details)
+
+### [31.7.2023] Prescan feature
+* Allows to scan all new file tasks with YARA. Must be enabled in `web.conf` -> `[general]` -> `yara_recon`.
+    * This allows you to set CAPE arguments, as tags for example for proper VM pickup.
+    * YARA name must ends with `Crypter`, `Packer`, `Obfuscator` or `Loader` and have `cape_name` and `cape_options` in meta. Example:
+    * See `def recon` in `CAPEv2/lib/cuckoo/common/web_utils.py`
+```
+rule X_cryptor {
+    meta:
+        author = "doomedraven"
+        description = "New X Crypter"
+        cape_type = "New X Crypter"
+        cape_options = "tags=win10"
+    strings:
+        $a = "New awesome crypter <3" fullword
+    condition:
+        $a
+}
+```
+
+### [28.7.2023]
+* Syscall hooks now enabled by default
+* Monitor updates:
+    * improved syscall hook logging, unpacker & debugger integration
+    * new debugger actions "call" & "setbpX"
+    * misc improvements
+
+### [18.7.2023]
+* FLARE CAPA v6 support. Is now uniq supported version. They doing breaking changes.
+
+### [14.7.2023]
+* Monitor update: Add hook for LoadLibraryExW
+
+### [7.7.2023]
+* UPX-type dynamic unpacker in yara sig
+* Monitor updates:
+    * New debugger action 'Step2OEP' for packers like UPX
+    * Deprecate obsolete UPX unpacker code
+    * misc improvements & fixes
+
+### [24.6.2023] EuskalHack feature
+* .inf detonation. Requires `sflock2==0.3.50`
+* New admin/admin.py - Cluster edition - [Documentation](https://capev2.readthedocs.io/en/latest/usage/cluster_administration.html)
+* New dependency. Run `cd /opt/CAPEv2 && poetry install`
+*
+### [19.6.2023]
+* Monitor update: misc improvements & fixes
+
 ### [13.6.2023]
 * Monitor update: fix issue with Microsoft Edge not launching properly (#1587)
 
@@ -31,7 +105,6 @@
 * Simplifing the configuration
     * Do NOT edit any config that ends on `.default` as it will be default config.
     * For more details read readme inside of `conf` folder.
-
 
 ### [30.3.2023]
 * RedLine config extraction - thanks @Gi7w0rm
