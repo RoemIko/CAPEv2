@@ -13,11 +13,11 @@ from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_exists, path_mkdir, path_write_file
 from lib.cuckoo.common.quarantine import unquarantine
 from lib.cuckoo.common.trim_utils import trim_file, trimmed_path
-from lib.cuckoo.common.utils import get_options, get_platform, sanitize_filename
+from lib.cuckoo.common.utils import get_options, sanitize_filename
 
-sf_version = ""
+sfFile = False
 try:
-    from sflock import __version__ as sf_version
+    # from sflock import __version__ as sf_version
     from sflock import unpack
     from sflock.abstracts import File as sfFile
     from sflock.exception import UnpackException
@@ -25,11 +25,8 @@ try:
 
     HAS_SFLOCK = True
 except ImportError:
-    print("You must install sflock\nsudo apt-get install p7zip-full lzip rar unace-nonfree cabextract\npip3 install -U SFlock2")
+    print("\n\n[!] Missing dependencies. Run: poetry install\n\n")
     HAS_SFLOCK = False
-
-if sf_version and int(sf_version.split(".")[-1]) < 42:
-    print("You using old version of sflock! Upgrade: pip3 install -U SFlock2")
 
 log = logging.getLogger(__name__)
 cuckoo_conf = Config()
@@ -109,8 +106,8 @@ whitelist_extensions = {"doc", "xls", "ppt", "pub", "jar"}
 blacklist_extensions = {"apk", "dmg"}
 
 # list of valid file types to extract - TODO: add more types
-VALID_TYPES = {"PE32", "Java Jar", "Outlook", "Message", "MS Windows shortcut", "PDF document"}
-VALID_LINUX_TYPES = {"Bourne-Again", "POSIX shell script", "ELF", "Python"}
+VALID_TYPES = {"PE32", "Java Jar", "Outlook", "Message", "MS Windows shortcut", "PDF document", *File.LINUX_TYPES}
+VALID_PACKAGES = {"doc", "xls", "ppt", "pdf"}
 OFFICE_TYPES = [
     "Composite Document File",
     "CDFV2 Encrypted",
@@ -130,7 +127,7 @@ def options2passwd(options: str) -> str:
     return password
 
 
-def demux_office(filename: bytes, password: str) -> List[bytes]:
+def demux_office(filename: bytes, password: str, platform: str) -> List[bytes]:
     retlist = []
     target_path = os.path.join(tmp_path, "cuckoo-tmp/msoffice-crypt-tmp")
     if not path_exists(target_path):
@@ -143,27 +140,40 @@ def demux_office(filename: bytes, password: str) -> List[bytes]:
         # TODO: add decryption verification checks
         if hasattr(d, "contents") and "Encrypted" not in d.magic:
             _ = path_write_file(decrypted_name, d.contents)
-            retlist.append(decrypted_name.encode())
+            retlist.append((decrypted_name.encode(), platform))
     else:
         raise CuckooDemuxError("MS Office decryptor not available")
 
     if not retlist:
-        retlist.append(filename)
+        retlist.append((filename, platform))
 
     return retlist
 
 
 def is_valid_type(magic: str) -> bool:
     # check for valid file types and don't rely just on file extension
-    VALID_TYPES.update(VALID_LINUX_TYPES)
     return any(ftype in magic for ftype in VALID_TYPES)
 
 
-def _sf_chlildren(child: sfFile) -> bytes:
+def is_valid_package(package: str) -> bool:
+    # check if the file has a valid package type
+    if not package:
+        return False
+    return any(ptype in package for ptype in VALID_PACKAGES)
+
+
+def _sf_children(child: sfFile) -> bytes:
     path_to_extract = ""
     _, ext = os.path.splitext(child.filename)
     ext = ext.lower()
-    if ext in demux_extensions_list or is_valid_type(child.magic) or (not ext and is_valid_type(child.magic)):
+    if (
+        ext in demux_extensions_list
+        or is_valid_package(child.package)
+        or is_valid_type(child.magic)
+        or (not ext and is_valid_type(child.magic))
+        # msix
+        or all([pattern in child.contents for pattern in (b"Registry.dat", b"AppxManifest.xml")])
+    ):
         target_path = os.path.join(tmp_path, "cuckoo-sflock")
         if not path_exists(target_path):
             path_mkdir(target_path)
@@ -177,7 +187,7 @@ def _sf_chlildren(child: sfFile) -> bytes:
     return path_to_extract.encode()
 
 
-def demux_sflock(filename: bytes, options: str) -> List[bytes]:
+def demux_sflock(filename: bytes, options: str, check_shellcode: bool = True) -> List[bytes]:
     retlist = []
     # do not extract from .bin (downloaded from us)
     if os.path.splitext(filename)[1] == b".bin":
@@ -186,30 +196,28 @@ def demux_sflock(filename: bytes, options: str) -> List[bytes]:
     try:
         password = options2passwd(options) or "infected"
         try:
-            unpacked = unpack(filename, password=password, check_shellcode=True)
+            unpacked = unpack(filename, password=password, check_shellcode=check_shellcode)
         except UnpackException:
-            unpacked = unpack(filename, check_shellcode=True)
+            unpacked = unpack(filename, check_shellcode=check_shellcode)
 
         if unpacked.package in whitelist_extensions:
             return [filename]
         if unpacked.package in blacklist_extensions:
-            return retlist
+            return [filename]
         for sf_child in unpacked.children:
             if sf_child.to_dict().get("children"):
-                retlist.extend(_sf_chlildren(ch) for ch in sf_child.children)
+                retlist.extend(_sf_children(ch) for ch in sf_child.children)
                 # child is not available, the original file should be put into the list
                 if filter(None, retlist):
-                    retlist.append(_sf_chlildren(sf_child))
+                    retlist.append(_sf_children(sf_child))
             else:
-                retlist.append(_sf_chlildren(sf_child))
+                retlist.append(_sf_children(sf_child))
     except Exception as e:
         log.error(e, exc_info=True)
     return list(filter(None, retlist))
 
 
-def demux_sample(
-    filename: bytes, package: str, options: str, use_sflock: bool = True, platform: str = ""
-):  #   -> tuple[bytes, str]:
+def demux_sample(filename: bytes, package: str, options: str, use_sflock: bool = True, platform: str = ""):  # -> tuple[bytes, str]:
     """
     If file is a ZIP, extract its included files and return their file paths
     If file is an email, extracts its attachments and return their file paths (later we'll also extract URLs)
@@ -219,16 +227,20 @@ def demux_sample(
     if isinstance(filename, str) and use_sflock:
         filename = filename.encode()
 
+    retlist = []
     # if a package was specified, trim if allowed and required
     if package:
-        retlist = []
-        if File(filename).get_size() <= web_cfg.general.max_sample_size or (
-            web_cfg.general.allow_ignore_size and "ignore_size_check" in options
-        ):
-            retlist.append((filename, platform))
+
+        if package in ("msix",):
+            retlist.append((filename, "windows"))
         else:
-            if web_cfg.general.enable_trim and trim_file(filename):
-                retlist.append((trimmed_path(filename), platform))
+            if File(filename).get_size() <= web_cfg.general.max_sample_size or (
+                web_cfg.general.allow_ignore_size and "ignore_size_check" in options
+            ):
+                retlist.append((filename, platform))
+            else:
+                if web_cfg.general.enable_trim and trim_file(filename):
+                    retlist.append((trimmed_path(filename), platform))
         return retlist
 
     # handle quarantine files
@@ -246,9 +258,10 @@ def demux_sample(
         password = options2passwd(options) or None
         if use_sflock:
             if HAS_SFLOCK:
-                return [(demux_office(filename, password), platform)]
+                retlist = demux_office(filename, password, platform)
+                return retlist
             else:
-                log.error("Detected password protected office file, but no sflock is installed: pip3 install -U sflock2")
+                log.error("Detected password protected office file, but no sflock is installed: poetry install")
 
     # don't try to extract from Java archives or executables
     if (
@@ -256,21 +269,26 @@ def demux_sample(
         or "Java archive data" in magic
         or "PE32" in magic
         or "MS-DOS executable" in magic
-        or any(x in magic for x in VALID_LINUX_TYPES)
+        or any(x in magic for x in File.LINUX_TYPES)
     ):
         retlist = []
         if File(filename).get_size() <= web_cfg.general.max_sample_size or (
             web_cfg.general.allow_ignore_size and "ignore_size_check" in options
         ):
-            retlist.append(filename)
+            retlist.append((filename, platform))
         else:
             if web_cfg.general.enable_trim and trim_file(filename):
-                retlist.append(trimmed_path(filename))
-        return [(retlist, platform)]
+                retlist.append((trimmed_path(filename), platform))
+        return retlist
 
     new_retlist = []
+
+    check_shellcode = True
+    if options and "check_shellcode=0" in options:
+        check_shellcode = False
+
     # all in one unarchiver
-    retlist = demux_sflock(filename, options) if HAS_SFLOCK and use_sflock else []
+    retlist = demux_sflock(filename, options, check_shellcode) if HAS_SFLOCK and use_sflock else []
     # if it isn't a ZIP or an email, or we aren't able to obtain anything interesting from either, then just submit the
     # original file
     if not retlist:
@@ -278,19 +296,18 @@ def demux_sample(
     else:
         for filename in retlist:
             # verify not Windows binaries here:
-            magic_type = File(filename).get_type()
-            platform = get_platform(magic_type)
+            file = File(filename)
+            magic_type = file.get_type()
+            platform = file.get_platform()
             if platform == "linux" and not linux_enabled and "Python" not in magic_type:
                 continue
 
-            if File(filename).get_size() > web_cfg.general.max_sample_size and not (
+            if file.get_size() > web_cfg.general.max_sample_size and not (
                 web_cfg.general.allow_ignore_size and "ignore_size_check" in options
             ):
                 if web_cfg.general.enable_trim:
                     # maybe identify here
                     if trim_file(filename):
                         filename = trimmed_path(filename)
-
             new_retlist.append((filename, platform))
-
     return new_retlist[:10]

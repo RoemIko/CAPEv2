@@ -5,13 +5,22 @@
 import xml.etree.ElementTree as ET
 
 from lib.cuckoo.common.abstracts import LibVirtMachinery
+from lib.cuckoo.common.exceptions import CuckooMachineError
 
 
 class KVM(LibVirtMachinery):
     """Virtualization layer for KVM based on python-libvirt."""
 
-    # Set KVM connection string.
-    dsn = "qemu:///system"
+    module_name = "kvm"
+
+    def _initialize_check(self):
+        """Runs all checks when a machine manager is initialized.
+        @raise CuckooMachineError: if configuration is invalid
+        """
+        if not self.options.kvm.dsn:
+            raise CuckooMachineError("KVM DSN is missing, please add it to the config file")
+        self.dsn = self.options.kvm.dsn
+        super(KVM, self)._initialize_check()
 
     def _get_interface(self, label):
         xml = ET.fromstring(self._lookup(label).XMLDesc())
@@ -33,3 +42,11 @@ class KVM(LibVirtMachinery):
                 self.db.set_machine_interface(label, iface)
             else:
                 print(f"Can't get iface for {label}")
+
+    def store_vnc_port(self, label: str, task_id: int):
+        xml = ET.fromstring(self._lookup(label).XMLDesc())
+        port = int(xml.find("./devices/graphics").get("port", -1))
+        if port and port != -1:
+            self.db.set_vnc_port(task_id, port)
+        else:
+            print(f"Can't get iface for {label}")

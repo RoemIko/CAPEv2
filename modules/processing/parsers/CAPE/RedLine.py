@@ -16,7 +16,7 @@ try:
 except ImportError:
     HAVE_DNFILE = False
 
-log = logging.getLogger()
+log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 
@@ -79,7 +79,14 @@ def extract_config(data):
     """
     )
 
-    patterns = [pattern, pattern2, pattern3, pattern4, pattern5]
+    # If the config file is stored in plaintext format
+    pattern6 = re.compile(
+        Rb"""(?x)
+    \x72(...)\x70\x80...\x04
+    \x72(...)\x70\x80...\x04
+    """
+    )
+    patterns = [pattern, pattern2, pattern3, pattern4, pattern5, pattern6]
     key = c2 = botnet = base_location = None
 
     user_strings = extract_strings(data=data, on_demand=True)
@@ -110,26 +117,27 @@ def extract_config(data):
 
     base_location = None
     with suppress(Exception):
-        base_location = user_strings.index("Authorization")
-        if base_location:
-            if not c2 or "." not in c2:
-                delta = base_location
-                while True:
-                    delta += 1
-                    if "==" in user_strings[delta]:
-                        c2 = user_strings[delta]
-                        if "=" in user_strings[delta + 1]:
-                            botnet = user_strings[delta + 1]
-                            key = user_strings[delta + 2]
-                            if "=" in key:
-                                key = user_strings[delta + 3]
-                        else:
-                            botnet = None
-                            key = user_strings[delta + 1]
-                        c2 = decrypt(c2, key)
-                        if botnet:
-                            botnet = decrypt(botnet, key)
-                        break
+        if "Authorization" in user_strings:
+            base_location = user_strings.index("Authorization")
+            if base_location:
+                if not c2 or "." not in c2:
+                    delta = base_location
+                    while True:
+                        delta += 1
+                        if "==" in user_strings[delta]:
+                            c2 = user_strings[delta]
+                            if "=" in user_strings[delta + 1]:
+                                botnet = user_strings[delta + 1]
+                                key = user_strings[delta + 2]
+                                if "=" in key:
+                                    key = user_strings[delta + 3]
+                            else:
+                                botnet = None
+                                key = user_strings[delta + 1]
+                            c2 = decrypt(c2, key)
+                            if botnet:
+                                botnet = decrypt(botnet, key)
+                            break
 
     if not c2 or "." not in c2 and HAVE_DNFILE:
         with suppress(Exception):
@@ -138,23 +146,37 @@ def extract_config(data):
                 extracted = []
                 for match in p.findall(data):
                     for item in match:
-                        user_string = dn.net.user_strings.get_us(int.from_bytes(item, "little")).value
+                        user_string = dn.net.user_strings.get(int.from_bytes(item, "little")).value
                         if user_string:
                             extracted.append(user_string)
                 if extracted:
-                    key = extracted[2]
-                    c2 = decrypt(extracted[0], key)
-                    botnet = decrypt(extracted[1], key)
-                    if "." in c2:
-                        break
+                    # Case-1: If the config file is stored in encrypted format
+                    if len(extracted) == 3:
+                        key = extracted[2]
+                        c2 = decrypt(extracted[0], key)
+                        botnet = decrypt(extracted[1], key)
+                        if "." in c2:
+                            break
+
+                    # Case-2: If the config file is stored in plaintext format
+                    else:
+                        c2 = extracted[0]
+                        botnet = extracted[1]
             dn.close()
 
     if not c2 or "." not in c2:
         return
 
     config_dict = {"C2": c2, "Botnet": botnet, "Key": key}
-    base_location = user_strings.index("Authorization")
-    if base_location:
-        config_dict["Authorization"] = user_strings[base_location - 1]
-
+    if "Authorization" in user_strings:
+        base_location = user_strings.index("Authorization")
+        if base_location:
+            config_dict["Authorization"] = user_strings[base_location - 1]
     return config_dict
+
+
+if __name__ == "__main__":
+    import sys
+
+    with open(sys.argv[1], "rb") as f:
+        print(extract_config(f.read()))

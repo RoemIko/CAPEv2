@@ -1,4 +1,5 @@
 #!/bin/bash
+# set -ex
 
 # Copyright (C) 2011-2023 doomedraven.
 # See the file 'LICENSE.md' for copying permission.
@@ -55,10 +56,10 @@ QTARGETS="--target-list=i386-softmmu,x86_64-softmmu,i386-linux-user,x86_64-linux
 
 
 #https://www.qemu.org/download/#source or https://download.qemu.org/
-qemu_version=8.0.2
+qemu_version=9.0.0
 # libvirt - https://libvirt.org/sources/
 # changelog - https://libvirt.org/news.html
-libvirt_version=9.4.0
+libvirt_version=10.3.0
 # virt-manager - https://github.com/virt-manager/virt-manager/releases
 # autofilled
 OS=""
@@ -108,14 +109,39 @@ src_bios_table_date2="11\/03\/2018"
 #01\/01\/2011
 src_fw_smbios_date="11\/03\/2018"
 
+# what to use as a replacement for QEMU in the tablet info
+PEN_REPLACER='<WOOT>'
+
+# what to use as a replacement for QEMU in the scsi disk info
+SCSI_REPLACER='<WOOT>'
+
+# what to use as a replacement for QEMU in the atapi disk info
+ATAPI_REPLACER='<WOOT>'
+
+# what to use as a replacement for QEMU in the microdrive info
+MICRODRIVE_REPLACER='<WOOT>'
+
+# what to use as a replacement for QEMU in bochs in drive info
+BOCHS_BLOCK_REPLACER='<WOOT>'
+BOCHS_BLOCK_REPLACER2='<WOOT>'
+BOCHS_BLOCK_REPLACER3='<WOOT>'
+
+# what to use as a replacement for BXPC in bochs in ACPI info
+BXPC_REPLACER='<WOOT>'
+
 # ToDO add to see if cpu supports VTx
 # egrep '(vmx|svm)' --color=always /proc/cpuinfo
 #* If your CPU is Intel, you need activate in __BIOS__ VT-x
 #    * (last letter can change, you can activate [TxT ](https://software.intel.com/en-us/blogs/2012/09/25/how-to-enable-an-intel-trusted-execution-technology-capable-server) too, and any other feature, but VT-* is very important)
 
+# if a config file is present, read it in
+if [ -f "./kvm-config.sh" ]; then
+        . ./kvm-config.sh
+fi
+
 # ToDo check if aptitude is installed if no refresh and install
-sudo apt update 2>/dev/null
-sudo apt install aptitude -y 2>/dev/null
+sudo apt-get update 2>/dev/null
+sudo apt-get install aptitude -y 2>/dev/null
 
 NC='\033[0m'
 RED='\033[0;31m'
@@ -155,11 +181,21 @@ cat << EndOfHelp
 
     Tips:
         * Latest kernels having some KVM features :)
-            * apt search linux-image
+            * apt-get search linux-image
         * QCOW2 allocations types performance
             * https://www.jamescoyle.net/how-to/1810-qcow2-disk-images-and-performance
             * https://www.jamescoyle.net/how-to/2060-qcow2-physical-size-with-different-preallocation-settings
 EndOfHelp
+}
+
+function configure_needreboot(){
+    # Ubuntu 22
+    # Disabele: Daemons using outdated libraries
+    # https://stackoverflow.com/questions/73397110/how-to-stop-ubuntu-pop-up-daemons-using-outdated-libraries-when-using-apt-to-i
+    sed -i "/#\$nrconf{restart} = 'i';/s/.*/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf
+    # Disabele: Pending kernel upgrade
+    # https://askubuntu.com/questions/1349884/how-to-disable-pending-kernel-upgrade-message
+    sed -i "s/#\$nrconf{kernelhints} = -1;/\$nrconf{kernelhints} = -1;/g" /etc/needrestart/needrestart.conf
 }
 
 function grub_iommu(){
@@ -193,9 +229,9 @@ function _enable_tcp_bbr() {
     modprobe br_netfilter
     echo "br_netfilter" >> /etc/modules
     {
-        echo "net.bridge.bridge-nf-call-arptables = 1";
-        echo "net.bridge.bridge-nf-call-ip6tables = 1";
-        echo "net.bridge.bridge-nf-call-iptables = 1";
+        echo "net.bridge.bridge-nf-call-arptables = 0";
+        echo "net.bridge.bridge-nf-call-ip6tables = 0";
+        echo "net.bridge.bridge-nf-call-iptables = 0";
         echo "net.core.rmem_max = 16777216";
         echo "net.core.wmem_max = 16777216";
         echo "net.ipv4.tcp_rmem = 4096 87380 16777216";
@@ -226,7 +262,7 @@ function install_libguestfs() {
     wget -O- https://packages.erlang-solutions.com/ubuntu/erlang_solutions.asc | sudo apt-key add -
     sudo add-apt-repository -y "deb https://packages.erlang-solutions.com/ubuntu $(lsb_release -sc) contrib"
     sudo aptitude install -f parted libyara3 erlang-dev gperf flex bison libaugeas-dev libhivex-dev supermin ocaml-nox libhivex-ocaml genisoimage libhivex-ocaml-dev libmagic-dev libjansson-dev gnulib jq ocaml-findlib -y 2>/dev/null
-    sudo apt update
+    sudo apt-get update
     sudo aptitude install -f erlang -y
 
     if [ ! -d libguestfs ]; then
@@ -304,7 +340,7 @@ function install_libvmi() {
 
     make -j"$(nproc)" install DESTDIR=/tmp/libvmi_builded
     dpkg-deb --build --root-owner-group /tmp/libvmi_builded
-    apt -y -o Dpkg::Options::="--force-overwrite" install /tmp/libvmi_builded.deb
+    apt-get -y -o Dpkg::Options::="--force-overwrite" install /tmp/libvmi_builded.deb
 
     /sbin/ldconfig
 
@@ -396,16 +432,17 @@ function install_pyvmidbg() {
     # r2 -d gdb://127.0.0.1:5000 -b 64
 }
 
+
 function install_libvirt() {
     # http://ask.xmodulo.com/compile-virt-manager-debian-ubuntu.html
     #rm -r /usr/local/lib/python2.7/dist-packages/libvirt*
 
     # remove old
-    apt purge libvirt0 libvirt-bin -y
+    apt-get purge libvirt0 libvirt-bin -y
     apt-mark hold libvirt0 libvirt-bin
 
     # In Ubuntu 22.04 the libvirt0 package is named libvirt
-    apt purge libvirt libvirt-bin -y
+    apt-get purge libvirt libvirt-bin -y
     apt-mark hold libvirt libvirt-bin
 
     # Remove any library binaries that might have been leftover
@@ -420,10 +457,10 @@ Pin-Priority: -1
 Package: libvirt0
 Pin: release *
 Pin-Priority: -1
-Package: libvirt
+Package: qemu
 Pin: release *
 Pin-Priority: -1
-Package: qemu
+Package: libvirt
 Pin: release *
 Pin-Priority: -1
 Package: gir1.2-libvirt-glib-1.0
@@ -442,9 +479,9 @@ EOH
     apt-mark hold qemu
     echo "qemu hold" | sudo dpkg --set-selections 2>/dev/null
     echo "[+] Checking/deleting old versions of Libvirt"
-    apt purge libvirt0 libvirt-bin libvirt-$libvirt_version 2>/dev/null
+    apt-get purge libvirt0 libvirt-bin libvirt-$libvirt_version 2>/dev/null
     dpkg -l|grep "libvirt-[0-9]\{1,2\}\.[0-9]\{1,2\}\.[0-9]\{1,2\}"|cut -d " " -f 3|sudo xargs dpkg --purge --force-all 2>/dev/null
-    sudo apt install mlocate libxml2-utils gnutls-bin  gnutls-dev libxml2-dev bash-completion libreadline-dev numactl libnuma-dev python3-docutils flex -y
+    apt-get install meson plocate libxml2-utils gnutls-bin  gnutls-dev libxml2-dev bash-completion libreadline-dev numactl libnuma-dev python3-docutils flex -y
     # Remove old links
     updatedb
     temp_libvirt_so_path=$(locate libvirt-qemu.so | head -n1 | awk '{print $1;}')
@@ -470,10 +507,12 @@ EOH
     tar xf libvirt-$libvirt_version.tar.xz
     cd libvirt-$libvirt_version || return
     if [ "$OS" = "Linux" ]; then
-        aptitude install -f mlocate iptables python3-dev unzip numad libglib2.0-dev libsdl1.2-dev lvm2 python3-pip ebtables libosinfo-1.0-dev libnl-3-dev libnl-route-3-dev libyajl-dev xsltproc libdevmapper-dev libpciaccess-dev dnsmasq dmidecode librbd-dev libtirpc-dev -y 2>/dev/null
+        aptitude install -f plocate iptables python3-dev unzip numad libglib2.0-dev libsdl1.2-dev lvm2 python3-pip ebtables libosinfo-1.0-dev libnl-3-dev libnl-route-3-dev libyajl-dev xsltproc libdevmapper-dev libpciaccess-dev dnsmasq dmidecode librbd-dev libtirpc-dev -y 2>/dev/null
+
+        # see https://github.com/doomedraven/Tools/issues/100
         install_apparmor
 
-        pip3 install ipaddr ninja meson flake8 -U
+        PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install ipaddr ninja meson flake8 -U
         # --prefix=/usr --localstatedir=/var --sysconfdir=/etc
         #git init
         #git remote add doomedraven https://github.com/libvirt/libvirt
@@ -554,11 +593,13 @@ EOH
     unzip v$libvirt_version.zip
     cd "libvirt-python-$libvirt_version" || return
     python3 setup.py build
-    pip3 install .
+    PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install .
+
     cd ..
     # Remove the $libvirt_version directory to permission errors when runing
     # cd /opt/CAPEv2/ ; sudo -u cape poetry run extra/poetry_libvirt_installer.sh later
     rm -r libvirt-python-$libvirt_version
+
     if [ "$OS" = "Linux" ]; then
         # https://github.com/libvirt/libvirt/commit/e94979e901517af9fdde358d7b7c92cc055dd50c
         groupname=""
@@ -582,6 +623,7 @@ EOH
         systemctl enable virtqemud.service virtnetworkd.service virtstoraged.service virtqemud.socket
         echo "[+] You should logout and login "
     fi
+
 }
 
 function install_virt_manager() {
@@ -618,7 +660,7 @@ function install_virt_manager() {
     gstreamer1.0-x adwaita-icon-theme at-spi2-core augeas-lenses cpu-checker dconf-gsettings-backend dconf-service \
     fontconfig fontconfig-config fonts-dejavu-core genisoimage gir1.2-appindicator3-0.1 gir1.2-secret-1 \
     gobject-introspection intltool pkg-config libxml2-dev libxslt-dev python3-dev gir1.2-gtk-vnc-2.0 gir1.2-spiceclientgtk-3.0 libgtk-3-dev \
-    mlocate gir1.2-gtksource-4 libgtksourceview-4-0 libgtksourceview-4-common checkinstall -y
+    mlocate gir1.2-gtksource-4 libgtksourceview-4-0 libgtksourceview-4-common -y
     # should be installed first
     # moved out as some 20.04 doesn't have this libs %)
     aptitude install -f -y python3-ntlm-auth libpython3-stdlib libbrlapi-dev libgirepository1.0-dev python3-testresources
@@ -646,20 +688,19 @@ function install_virt_manager() {
         gpg --verify "libvirt-glib-3.0.0.tar.gz.asc"
 
     fi
+    # ToDo add blacklist
     tar xf libvirt-glib-3.0.0.tar.gz
     cd libvirt-glib-3.0.0 || return
     aclocal && libtoolize --force
     automake --add-missing
     ./configure
-    # mkdir -p /tmp/libvirt-glib_builded/DEBIAN
-    # echo -e "Package: libvirt-glib-1.0-0\nVersion: 1.0-0\nArchitecture: $ARCH\nMaintainer: $MAINTAINER\nDescription: libvirt-glib-1.0-0" > /tmp/libvirt-glib_builded/DEBIAN/control
-    # make -j"$(nproc)" install DESTDIR=/tmp/libvirt-glib_builded
-    # dpkg-deb --build --root-owner-group /tmp/libvirt-glib_builded
-    # apt -y -o Dpkg::Options::="--force-overwrite" install /tmp/libvirt-glib_builded.deb
-
+    mkdir -p /tmp/libvirt-glib_builded/DEBIAN
+    echo -e "Package: libvirt-glib-1.0-0\nVersion: 1.0.0\nArchitecture: $ARCH\nMaintainer: $MAINTAINER\nDescription: Custom libvirt-glib-1.0-0" > /tmp/libvirt-glib_builded/DEBIAN/control
+    make -j"$(nproc)" install DESTDIR=/tmp/libvirt-glib_builded
+    dpkg-deb --build --root-owner-group /tmp/libvirt-glib_builded
+    apt-get -y -o Dpkg::Options::="--force-overwrite" install /tmp/libvirt-glib_builded.deb
     make -j"$(nproc)"
-    # ToDo add blacklist
-    checkinstall --pkgname=libvirt-glib-1.0-0 --default
+
     # v4 is meson based
     # sudo meson build -D system=true
     cd /tmp || return
@@ -697,7 +738,7 @@ function install_virt_manager() {
 
 function install_kvm_linux() {
     sed -i 's/# deb-src/deb-src/g' /etc/apt/sources.list
-    apt update 2>/dev/null
+    apt-get update 2>/dev/null
     aptitude install -f build-essential locate python3-pip gcc pkg-config cpu-checker intltool libtirpc-dev -y 2>/dev/null
     aptitude install -f gtk-update-icon-cache -y 2>/dev/null
 
@@ -749,13 +790,13 @@ function replace_qemu_clues_public() {
     _sed_aux "s/QEMU HARDDISK/$qemu_hd_replacement/g" qemu*/hw/scsi/scsi-disk.c 'QEMU HARDDISK was not replaced in scsi-disk.c'
     _sed_aux "s/QEMU DVD-ROM/$qemu_dvd_replacement/g" qemu*/hw/ide/core.c 'QEMU DVD-ROM was not replaced in core.c'
     _sed_aux "s/QEMU DVD-ROM/$qemu_dvd_replacement/g" qemu*/hw/ide/atapi.c 'QEMU DVD-ROM was not replaced in atapi.c'
-    _sed_aux "s/QEMU PenPartner tablet/<WOOT> PenPartner tablet/g" qemu*/hw/usb/dev-wacom.c 'QEMU PenPartner tablet'
-    _sed_aux 's/s->vendor = g_strdup("QEMU");/s->vendor = g_strdup("<WOOT>");/g' qemu*/hw/scsi/scsi-disk.c 'Vendor string was not replaced in scsi-disk.c'
+    _sed_aux "s/QEMU PenPartner tablet/$PEN_REPLACER PenPartner tablet/g" qemu*/hw/usb/dev-wacom.c 'QEMU PenPartner tablet'
+    _sed_aux 's/s->vendor = g_strdup("QEMU");/s->vendor = g_strdup("'"$SCSI_REPLACER"'");/g' qemu*/hw/scsi/scsi-disk.c 'Vendor string was not replaced in scsi-disk.c'
     _sed_aux "s/QEMU CD-ROM/$qemu_dvd_replacement/g" qemu*/hw/scsi/scsi-disk.c 'Vendor string was not replaced in scsi-disk.c'
-    _sed_aux 's/padstr8(buf + 8, 8, "QEMU");/padstr8(buf + 8, 8, "<WOOT>");/g'  qemu*/hw/ide/atapi.c 'padstr was not replaced in atapi.c'
-    _sed_aux 's/QEMU MICRODRIVE/<WOOT> MICRODRIVE/g' qemu*/hw/ide/core.c 'QEMU MICRODRIVE was not replaced in core.c'
-    _sed_aux "s/KVMKVMKVM\\0\\0\\0/$hypervisor_string_replacemnt/g" qemu*/target/i386/kvm.c 'KVMKVMKVM was not replaced in kvm.c'
-    _sed_aux 's/"bochs"/"<WOOT>"/g' qemu*/block/bochs.c 'BOCHS was not replaced in block/bochs.c'
+    _sed_aux 's/padstr8(buf + 8, 8, "QEMU");/padstr8(buf + 8, 8, "'"$ATAPI_REPLACER"'");/g'  qemu*/hw/ide/atapi.c 'padstr was not replaced in atapi.c'
+    _sed_aux 's/QEMU MICRODRIVE/'"$MICRODRIVE_REPLACER"' MICRODRIVE/g' qemu*/hw/ide/core.c 'QEMU MICRODRIVE was not replaced in core.c'
+    _sed_aux "s/KVMKVMKVM\\\\0\\\\0\\\\0/$hypervisor_string_replacemnt/g" qemu*/target/i386/kvm/kvm.c 'KVMKVMKVM was not replaced in kvm.c'
+    _sed_aux 's/"bochs"/"'"$BOCHS_BLOCK_REPLACER"'"/g' qemu*/block/bochs.c 'BOCHS was not replaced in block/bochs.c'
     _sed_aux 's/"BOCHS "/"ALASKA"/g' qemu*/include/hw/acpi/aml-build.h 'BOCHS was not replaced in block/bochs.c'
     _sed_aux 's/Bochs Pseudo/Intel RealTime/g' qemu*/roms/ipxe/src/drivers/net/pnic.c 'Bochs Pseudo was not replaced in roms/ipxe/src/drivers/net/pnic.c'
 }
@@ -779,17 +820,17 @@ function replace_seabios_clues_public() {
         #src/fw/paravirt.c
     )
     for file in "${FILES[@]}"; do
-        _sed_aux 's/"QEMU/"<WOOT>/g' "$file" "QEMU was not replaced in $file"
+        _sed_aux 's/"QEMU"/"'"$BOCHS_BLOCK_REPLACER2"'"/g' "$file" "QEMU was not replaced in $file"
     done
 
-    _sed_aux 's/"QEMU"/"<WOOT>"/g' src/hw/blockcmd.c '"QEMU" was not replaced in  src/hw/blockcmd.c'
+    _sed_aux 's/"QEMU"/"'"$BOCHS_BLOCK_REPLACER3"'"/g' src/hw/blockcmd.c '"QEMU" was not replaced in  src/hw/blockcmd.c'
 
     FILES=(
         "src/fw/acpi-dsdt.dsl"
         "src/fw/q35-acpi-dsdt.dsl"
     )
     for file in "${FILES[@]}"; do
-        _sed_aux 's/"BXPC"/"<WOOT>"/g' "$file" "BXPC was not replaced in $file"
+        _sed_aux 's/"BXPC"/"'"$BXPC_REPLACER"'"/g' "$file" "BXPC was not replaced in $file"
     done
     _sed_aux 's/"BXPC"/"AMPC"/g' "src/fw/ssdt-pcihp.dsl" 'BXPC was not replaced in src/fw/ssdt-pcihp.dsl'
     _sed_aux 's/"BXDSDT"/"AMDSDT"/g' "src/fw/ssdt-pcihp.dsl" 'BXDSDT was not replaced in src/fw/ssdt-pcihp.dsl'
@@ -824,8 +865,6 @@ function install_jemalloc() {
 
 function install_qemu() {
     cd /tmp || return
-    install_jemalloc
-    cd /tmp || return
 
     echo '[+] Cleaning QEMU old install if exists'
     rm -r /usr/share/qemu >/dev/null 2>&1
@@ -850,14 +889,15 @@ function install_qemu() {
     fi
 
     if [ "$OS" = "Linux" ]; then
+        # ToDo add check if we have those repos already
         aptitude install -f software-properties-common -y
         add-apt-repository universe -y
-        apt update 2>/dev/null
-        aptitude install -f python3-pip libssh2-1-dev vde2 liblzo2-dev libghc-gtk3-dev libsnappy-dev libbz2-dev libxml2-dev google-perftools libgoogle-perftools-dev libvde-dev python3-sphinx-rtd-theme -y
+        apt-get update 2>/dev/null
+        aptitude install -f python3-pip ninja-build libssh2-1-dev vde2 liblzo2-dev libghc-gtk3-dev libsnappy-dev libbz2-dev libxml2-dev google-perftools libgoogle-perftools-dev libvde-dev python3-sphinx-rtd-theme -y
         aptitude install -f debhelper libusb-1.0-0-dev libxen-dev uuid-dev xfslibs-dev libjpeg-dev libusbredirparser-dev device-tree-compiler texinfo libbluetooth-dev libbrlapi-dev libcap-ng-dev libcurl4-gnutls-dev libfdt-dev gnutls-dev libiscsi-dev libncurses5-dev libnuma-dev libcacard-dev librados-dev librbd-dev libsasl2-dev libseccomp-dev libspice-server-dev libaio-dev libcap-dev libattr1-dev libpixman-1-dev libgtk2.0-bin  libxml2-utils systemtap-sdt-dev uml-utilities libcapstone-dev -y
         # qemu docs required
         PERL_MM_USE_DEFAULT=1 perl -MCPAN -e install "Perl/perl-podlators"
-        pip3 install sphinx ninja
+        PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install sphinx ninja
     fi
     # WOOT
     # some checks may be depricated, but keeping them for compatibility with old versions
@@ -869,13 +909,36 @@ function install_qemu() {
             # Public version
             replace_qemu_clues_public
         fi
+
+        cd qemu-$qemu_version/roms/ || exit 1
+        echo '[+] Making bios.bin ...'
+        sed -i 's/CONFIG_XEN=y/CONFIG_XEN=n/g' ./config.seabios-microvm
+        sed -i 's/CONFIG_XEN=y/CONFIG_XEN=n/g' ./config.seabios-128k
+        sed -i 's/PYTHON=python/PYTHON=python3/g' seabios/Makefile
+        PIP_BREAK_SYSTEM_PACKAGES=1 make bios
+        if [ $? -eq 0 ]; then
+            echo '[+] Completed '
+        else
+            echo '[-] Failed $?'
+        fi
+
+        echo '[+] Making vgabios bins...'
+        PIP_BREAK_SYSTEM_PACKAGES=1 make vgabios
+        if [ $? -eq 0 ]; then
+            echo '[+] Completed '
+        else
+            echo '[-] Failed $?'
+        fi
+
+        cd -
+
         # ToDo reintroduce it?
         #if [ $fail -eq 0 ]; then
             echo '[+] Starting compile it'
             cd qemu-$qemu_version || return
             # add in future --enable-netmap https://sgros-students.blogspot.com/2016/05/installing-and-testing-netmap.html
             # remove --target-list=i386-softmmu,x86_64-softmmu,i386-linux-user,x86_64-linux-user  if you want all targets
-                ./configure $QTARGETS --prefix=/usr --libexecdir=/usr/lib/qemu --localstatedir=/var --bindir=/usr/bin/ --enable-gnutls --enable-docs --enable-gtk --enable-vnc --enable-vnc-sasl --enable-curl --enable-kvm  --enable-linux-aio --enable-cap-ng --enable-vhost-net --enable-vhost-crypto --enable-spice --enable-usb-redir --enable-lzo --enable-snappy --enable-bzip2 --enable-coroutine-pool --enable-malloc=jemalloc --enable-replication --enable-tools
+                ./configure $QTARGETS --prefix=/usr --libexecdir=/usr/lib/qemu --localstatedir=/var --bindir=/usr/bin/ --enable-gnutls --enable-docs --enable-gtk --enable-vnc --enable-vnc-sasl --enable-curl --enable-kvm  --enable-linux-aio --enable-cap-ng --enable-vhost-net --enable-vhost-crypto --enable-spice --enable-usb-redir --enable-lzo --enable-snappy --enable-bzip2 --enable-coroutine-pool --enable-replication --enable-tools
                 #  --enable-capstone
             if  [ $? -eq 0 ]; then
                 echo '[+] Starting Install it'
@@ -885,12 +948,8 @@ function install_qemu() {
                 mkdir -p /tmp/qemu-"$qemu_version"_builded/DEBIAN
                 echo -e "Package: qemu\nVersion: $qemu_version\nArchitecture: $ARCH\nMaintainer: $MAINTAINER\nDescription: Custom antivm qemu" > /tmp/qemu-"$qemu_version"_builded/DEBIAN/control
                 make -j"$(nproc)" install DESTDIR=/tmp/qemu-"$qemu_version"_builded
-                if [ "$OS" = "Linux" ]; then
-                    dpkg-deb --build --root-owner-group /tmp/qemu-"$qemu_version"_builded
-                    apt -y -o Dpkg::Options::="--force-overwrite" install /tmp/qemu-"$qemu_version"_builded.deb
-                elif [ "$OS" = "Darwin" ]; then
-                    make -j"$(nproc)" install
-                fi
+                dpkg-deb --build --root-owner-group /tmp/qemu-"$qemu_version"_builded
+                apt-get -y -o Dpkg::Options::="--force-overwrite" install /tmp/qemu-"$qemu_version"_builded.deb
                 # hack for libvirt/virt-manager
                 if [ ! -f /usr/bin/qemu-system-x86_64-spice ]; then
                     ln -s /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-x86_64-spice
@@ -920,7 +979,7 @@ function install_qemu() {
     if [ "$OS" = "linux" ]; then
         dpkg --get-selections | grep "qemu" | xargs apt-mark hold
         dpkg --get-selections | grep "libvirt" | xargs apt-mark hold
-        apt-mark unhold qemu libvirt
+        apt-mark hold qemu libvirt
     fi
 
 }
@@ -1045,7 +1104,7 @@ cat << EndOfHelp
     * Error:
         /libvirt.so.0: version LIBVIRT_PRIVATE_x.x.0' not found (required by /usr/sbin/libvirtd)
     * Solutions:
-        1. apt purge libvirt0 libvirt-bin
+        1. apt-get purge libvirt0 libvirt-bin
         2. reboot
         3. $0 libvirt
 
@@ -1246,13 +1305,14 @@ OS="$(uname -s)"
 MAINTAINER="$(whoami)"_"$(hostname)"
 ARCH="$(dpkg --print-architecture)"
 #add-apt-repository universe
-#apt update && apt upgrade
+#apt-get update && apt-get upgrade
 #make
 
 case "$COMMAND" in
 'issues')
     issues;;
 'all')
+    configure_needreboot
     aptitude install -f language-pack-UTF-8 -y
     install_qemu
     install_seabios
@@ -1326,6 +1386,8 @@ case "$COMMAND" in
     grub_iommu;;
 'jemalloc')
     install_jemalloc;;
+'needreboot')
+    configure_needreboot;;
 'mosh')
     if [ "$OS" = "Linux" ]; then
         sudo aptitude install -f mosh -y

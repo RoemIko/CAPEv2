@@ -23,24 +23,35 @@ try:
     HAVE_OLEFILE = True
 except ImportError:
     HAVE_OLEFILE = False
-    print("Missed olefile dependency: pip3 install olefile")
+    print("Missed olefile dependency: poetry run pip install olefile")
 
 try:
     from csv import Error as csv_error
 
+    import oletools.olevba
     from oletools import oleobj
     from oletools.msodde import process_file as extract_dde
     from oletools.oleid import OleID
     from oletools.olevba import UnexpectedDataError, VBA_Parser, detect_autoexec, detect_hex_strings, detect_suspicious, filter_vba
     from oletools.rtfobj import RtfObjParser, is_rtf
 
+    # disable this noisy logging
+    old_enable_logging = oletools.olevba.enable_logging
+
+    def enable_logging():
+        log = logging.getLogger(__name__)
+        log.setLevel(logging.CRITICAL)
+
+    oletools.olevba.enable_logging = enable_logging
+
     HAVE_OLETOOLS = True
 except ImportError:
-    print("Missed oletools dependency: pip3 install oletools")
+    print("Missed oletools dependency: poetry run pip install olefile")
     HAVE_OLETOOLS = False
 
 logging.getLogger("msodde").setLevel(logging.CRITICAL)
 logging.getLogger("olevba").setLevel(logging.CRITICAL)
+logging.getLogger("crypto").setLevel(logging.CRITICAL)
 
 processing_conf = Config("processing")
 
@@ -101,8 +112,11 @@ class Office:
         metares = {"SummaryInformation": {}, "DocumentSummaryInformation": {}}
 
         for elem in core._get_documentElement().childNodes:
-            n = elem._get_tagName()
             try:
+                if isinstance(elem, xml.dom.minidom.Text):
+                    continue
+
+                n = elem._get_tagName()
                 data = core.getElementsByTagName(n)
                 if not data:
                     continue
@@ -217,7 +231,6 @@ class Office:
         vba = False
         if is_rtf(filepath):
             try:
-
                 contents = path_read_file(filepath)
                 temp_results = self._parse_rtf(contents)
                 if temp_results:
@@ -239,7 +252,7 @@ class Office:
         except (csv_error, UnicodeDecodeError):
             pass
         except AttributeError:
-            log.warning("OleFile library bug: AttributeError! fix: pip3 install -U olefile")
+            log.warning("OleFile library bug: AttributeError! fix: poetry run pip install olefile")
         except Exception as e:
             log.error(e, exc_info=True)
 
@@ -301,8 +314,8 @@ class Office:
                             officeresults["Macro"]["Analysis"].setdefault("HexStrings", []).append(
                                 (encoded, convert_to_printable(decoded))
                             )
-            except (AssertionError, UnexpectedDataError) as e:
-                log.warning("Macros in static.py", e)
+            except (AssertionError, UnexpectedDataError, ValueError, AttributeError) as e:
+                log.warning("Macros in parse_office.py", e)
 
             if HAVE_VBA2GRAPH:
                 vba2graph_func(filepath, self.task_id, self.sha256)

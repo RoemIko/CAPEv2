@@ -1,5 +1,9 @@
 # import pytest
 
+import pathlib
+
+import pytest
+
 from lib.cuckoo.common.objects import File
 
 try:
@@ -8,6 +12,36 @@ try:
     HAVE_YARA = True
 except ImportError:
     HAVE_YARA = False
+
+
+try:
+    import yara_x
+
+    HAVE_YARA_X = True
+except ImportError:
+    HAVE_YARA_X = False
+
+
+def test_yara_x():
+    if not HAVE_YARA_X:
+        return
+
+    rules = yara_x.compile(
+        """
+        rule test {
+            strings:
+            $a = "foobar"
+            condition:
+            $a
+        }"""
+    )
+
+    results = rules.scan(b"foobar")
+
+    assert results.matching_rules[0].identifier == "test"
+    assert results.matching_rules[0].patterns[0].identifier == "$a"
+    assert results.matching_rules[0].patterns[0].matches[0].offset == 0
+    assert results.matching_rules[0].patterns[0].matches[0].length == 6
 
 
 def test_yara():
@@ -33,6 +67,7 @@ def test_yara():
     _ = yara.compile(source='import "dotnet" rule a { condition: false }')
 
 
+@pytest.mark.skipif(not (pathlib.Path(__file__).parent / "data" / "malware").exists(), reason="Required data file is not present")
 def test_get_yaras():
     File.init_yara()
     yara_matches = File("tests/data/malware/f8a6eddcec59934c42ea254cdd942fb62917b5898f71f0feeae6826ba4f3470d").get_yara(

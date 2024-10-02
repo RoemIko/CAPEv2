@@ -123,7 +123,7 @@ class packedSetting:
         conf_data = full_config_data[data_offset + repr_len : data_offset + repr_len + self.length]
         if self.datatype == confConsts.TYPE_SHORT:
             conf_data = unpack(">H", conf_data)[0]
-            if not conf_data:
+            if conf_data is None:
                 return
             if self.is_bool:
                 return str(conf_data != self.bool_false_value)
@@ -171,7 +171,7 @@ class packedSetting:
                             string1 = netunpack(b"I$", conf_data[i + 3 :])[0].decode()
                             string2 = netunpack(b"I$", conf_data[i + 3 + 4 + len(string1) :])[0].decode()
                             ret_arr.append("{}:{}".format(string1.strip("\x00"), string2.strip("\x00")))
-                        i += len(string1) + len(string2) + 11
+                            i += len(string1) + len(string2) + 11
 
             elif self.is_transform:
                 if conf_data == bytes(len(conf_data)):
@@ -245,7 +245,7 @@ class BeaconSettings:
 
     def __init__(self, version):
         if version not in SUPPORTED_VERSIONS:
-            log.info("Error: Only supports version 3 and 4, not %d", version)
+            log.debug("Error: Only supports version 3 and 4, not %d", version)
         self.version = version
         self.settings = OrderedDict()
         self.init()
@@ -332,8 +332,10 @@ class cobaltstrikeConfig:
 
     def _parse_config(self, version, quiet=False, as_json=False):
         parsed_config = {}
-        re_start_match = re.search(confConsts.START_PATTERNS[version], self.data)
-        re_start_decoded_match = re.search(confConsts.START_PATTERN_DECODED, self.data)
+        comp_pattern = re.compile(confConsts.START_PATTERNS[version], re.DOTALL)
+        re_start_match = comp_pattern.search(self.data)
+        comp_pattern_decoded = re.compile(confConsts.START_PATTERN_DECODED, re.DOTALL)
+        re_start_decoded_match = comp_pattern_decoded.search(self.data)
 
         if not re_start_match and not re_start_decoded_match:
             return False
@@ -358,13 +360,13 @@ class cobaltstrikeConfig:
             if parsed_setting == "Not Found" and quiet:
                 continue
             if not isinstance(parsed_setting, list):
-                log.info("{: <{width}} - {val}".format(conf_name, width=COLUMN_WIDTH - 3, val=parsed_setting))
+                log.debug("{: <{width}} - {val}".format(conf_name, width=COLUMN_WIDTH - 3, val=parsed_setting))
             elif parsed_setting == []:
-                log.info("{: <{width}} - {val}".format(conf_name, width=COLUMN_WIDTH - 3, val="Empty"))
+                log.debug("{: <{width}} - {val}".format(conf_name, width=COLUMN_WIDTH - 3, val="Empty"))
             else:
-                log.info("{: <{width}} - {val}".format(conf_name, width=COLUMN_WIDTH - 3, val=parsed_setting[0]))
+                log.debug("{: <{width}} - {val}".format(conf_name, width=COLUMN_WIDTH - 3, val=parsed_setting[0]))
                 for val in parsed_setting[1:]:
-                    log.info(" " * COLUMN_WIDTH, end="")
+                    log.debug(" " * COLUMN_WIDTH, end="")
                     print(val)
 
         if as_json:
@@ -390,7 +392,7 @@ class cobaltstrikeConfig:
                 return conf
 
         if __name__ == "__main__":
-            log.info("Configuration not found. Are you sure this is a beacon?")
+            log.debug("Configuration not found. Are you sure this is a beacon?")
         return None
 
     def parse_encrypted_config(self, version=None, quiet=False, as_json=False):
@@ -401,7 +403,10 @@ class cobaltstrikeConfig:
         """
 
         THRESHOLD = 1100
-        pe = pefile.PE(data=self.data)
+        try:
+            pe = pefile.PE(data=self.data)
+        except pefile.PEFormatError:
+            return {}
         data_sections = [s for s in pe.sections if s.Name.find(b".data") != -1]
         if not data_sections:
             return None
@@ -420,7 +425,7 @@ class cobaltstrikeConfig:
             offset += 4
 
         if not key_found:
-            log.info("Failed to find encrypted data (try to lower the threshold constant)")
+            log.debug("Failed to find encrypted data (try to lower the threshold constant)")
             return None
 
         # decrypt and parse

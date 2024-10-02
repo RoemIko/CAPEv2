@@ -7,6 +7,7 @@ import datetime
 import glob
 import json
 import logging
+import ntpath
 import os
 import shutil
 import socket
@@ -22,6 +23,7 @@ from lib.cuckoo.common.config import Config, parse_options
 from lib.cuckoo.common.constants import ANALYSIS_BASE_PATH, CUCKOO_GUEST_PORT, CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooGuestCriticalTimeout, CuckooGuestError
 from lib.cuckoo.common.path_utils import path_exists, path_mkdir
+from lib.cuckoo.common.utils import sanitize_filename
 from lib.cuckoo.core.database import Database
 
 log = logging.getLogger(__name__)
@@ -115,6 +117,14 @@ class GuestManager:
         do_raise and r.raise_for_status()
         return r
 
+    def get_status_from_db(self) -> str:
+        with db.session.begin():
+            return db.guest_get_status(self.task_id)
+
+    def set_status_in_db(self, status: str):
+        with db.session.begin():
+            db.guest_set_status(self.task_id, status)
+
     def post(self, method, *args, **kwargs):
         """Simple wrapper around requests.post()."""
         url = f"http://{self.ipaddr}:{self.port}{method}"
@@ -138,7 +148,7 @@ class GuestManager:
         """Wait until the Virtual Machine is available for usage."""
         start = timeit.default_timer()
 
-        while db.guest_get_status(self.task_id) == "starting" and self.do_run:
+        while self.do_run and self.get_status_from_db() == "starting":
             try:
                 socket.create_connection((self.ipaddr, self.port), 1).close()
                 break
@@ -246,7 +256,7 @@ class GuestManager:
 
         # Could be beautified a bit, but basically we have to perform the
         # same check here as we did in wait_available().
-        if db.guest_get_status(self.task_id) != "starting":
+        if self.get_status_from_db() != "starting":
             return
 
         r = self.get("/", do_raise=False)
@@ -260,7 +270,7 @@ class GuestManager:
                 r.status_code,
                 json.dumps(dict(r.headers)),
             )
-            db.guest_set_status(self.task_id, "failed")
+            self.set_status_in_db("failed")
             return
 
         try:
@@ -274,7 +284,7 @@ class GuestManager:
                 "go through the documentation once more and otherwise inform "
                 "the Cuckoo Developers of your issue"
             )
-            db.guest_set_status(self.task_id, "failed")
+            self.set_status_in_db("failed")
             return
 
         log.info("Task #%s: Guest is running CAPE Agent %s (id=%s, ip=%s)", self.task_id, version, self.vmid, self.ipaddr)
@@ -300,16 +310,20 @@ class GuestManager:
         # Lookup file if current doesn't exist in TMP anymore
         alternative_path = False
         if not path_exists(options["target"]):
-            path_found = db.sample_path_by_hash(task_id=options["id"])
+            with db.session.begin():
+                path_found = db.sample_path_by_hash(task_id=options["id"])
             if path_found:
                 alternative_path = path_found[0]
 
         sample_path = alternative_path or options["target"]
         # If the target is a file, upload it to the guest.
         if options["category"] in ("file", "archive"):
-            data = {
-                "filepath": os.path.join(self.determine_temp_path(), options["file_name"]),
-            }
+            # Use the correct os.sep in the filepath based on what OS this file is destined for
+            if self.platform == "windows":
+                filepath = ntpath.join(self.determine_temp_path(), sanitize_filename(options["file_name"]))
+            else:
+                filepath = os.path.join(self.determine_temp_path(), sanitize_filename(options["file_name"]))
+            data = {"filepath": filepath}
             files = {
                 "file": ("sample.bin", open(sample_path, "rb")),
             }
@@ -320,8 +334,8 @@ class GuestManager:
 
         # Debug analyzer.py in vm
         if "CAPE_DBG" in os.environ:
-            while True:
-                pass
+            # change this to input so we can resume
+            input("CAPE DBG enabled. Introduce any text to resume")
 
         if "execpy" in features:
             data = {
@@ -340,17 +354,20 @@ class GuestManager:
             self.post("/execute", data=data)
 
     def wait_for_completion(self):
-
         count = 0
         start = timeit.default_timer()
 
-        while db.guest_get_status(self.task_id) == "running" and self.do_run:
-            if count >= 5:
-                log.debug("Task #%s: Analysis is still running (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
-                count = 0
-
-            count += 1
+        while self.do_run and self.get_status_from_db() == "running":
             time.sleep(1)
+
+            if cfg.cuckoo.machinery_screenshots:
+                if count == 0:
+                    # indicate screenshot captures have started
+                    log.info("Task #%s: Started capturing screenshots for %s", self.task_id, self.vmid)
+                self.analysis_manager.screenshot_machine()
+            count += 1
+            if count % 5 == 0:
+                log.debug("Task #%s: Analysis is still running (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
 
             # If the analysis hits the critical timeout, just return straight
             # away and try to recover the analysis results from the guest.
@@ -374,9 +391,10 @@ class GuestManager:
                 log.error("Task #%s: Virtual machine %s /status failed. %s", self.task_id, self.vmid, e, exc_info=True)
                 continue
 
-            if status["status"] == "complete":
-                log.info("Task #%s: Analysis completed successfully (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
-                db.guest_set_status(self.task_id, "complete")
+            if status["status"] in ("complete", "failed"):
+                completed_as = "completed successfully" if status["status"] == "complete" else "failed"
+                log.info("Task #%s: Analysis %s (id=%s, ip=%s)", self.task_id, completed_as, self.vmid, self.ipaddr)
+                self.set_status_in_db("complete")
                 return
             elif status["status"] == "exception":
                 log.warning(
@@ -386,5 +404,5 @@ class GuestManager:
                     self.ipaddr,
                     status["description"],
                 )
-                db.guest_set_status(self.task_id, "failed")
+                self.set_status_in_db("failed")
                 return

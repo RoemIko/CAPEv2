@@ -1,7 +1,284 @@
+### [01.10.2024]
+* Monitor update: Improve fix for size bug with unpacking embedded PEs
+
+### [26.09.2024] Browser monitoring
+* [Browser extension details](https://github.com/kevoreilly/CAPEv2/tree/master/extra/browser_extension/README.md). For code details see [PR](https://github.com/kevoreilly/CAPEv2/pull/2330)
+
+### [23.09.2024]
+* Monitor update: Fix size bug with unpacking embedded PEs
+* .NET loader 'SlowLoader' detonation shim for slower cpus (race condition)
+
+### [18.09.2024]
+* Monitor updates:
+    * Add disassembled instruction to exception output
+    * VBScript hook improvements (thanks Jeremy at Proofpoint)
+
+### [13.09.2024]
+* Fix issue with sign extension causing 32-bit values to be misrepresented in web ui (e.g. 0xffffffffc000005 for 0xc000005)
+* bytes2str(): if any values in dict type are already str then keep them
+* Expand behavior log process information with image base, image size and bitness
+
+### [10.09.2024]
+* Monitor update: Add capability to dynamically unhook previously hooked functions (unhook-apis option takes colon-separated list e.g. unhook-apis=NtSetInformationThread:NtDelayExecution)
+* Themida detonation shim
+
+### [03.09.2024]
+* Monitor updates:
+    * Add HtaFile to CLSIDS handled in WMI/DCOM (e.g. FormBook) - thanks Will Metcalf
+    * VBScript hooks
+
+### [16.08.2024]
+* TTD integration (Microsoft Time Travel Debugging)
+    * Use submission option ttd=1
+    * Place TTD binaries in analyzer/windows/bin (with wow64 subdirectory for 32-bit)
+    * .trc files output to TTD directory in results folder for manual retrieval
+* Monitor update: Small debugger fix
+
+### [07.08.2024]
+* Monitor update: Set language via lang=X (language code) submission option
+
+### [05.08.2024]
+* SparkRAT config parser - thanks t-mtsmt
+
+### [22.07.2024]
+* Monitor update: Enhancements to software (& syscall) breakpoint mechanism, add handling for Internet Shortcut CLSID (.url)
+
+### [11.07.2024]
+* Monitor updates:
+    * (in)direct syscall handling enhancements
+    * unpacking & scanning: improved entropy checks
+
+### [26.06.2024]
+* Monitor updates: debugger/trace enhancements
+
+### [21.06.2024]
+* Monitor updates: misc enhancements & fixes (see capemon repo for details)
+
+### [12.06.2024]
+* Monitor update: Unpacker enhancement: capture modified mapped images
+
+### [10.06.2024]
+* Monitor update: Fix for 64-bit Firefox
+
+### [04.06.2024]
+* Monitor update: New hooks (GetAddrInfoExW, CLSIDFromProgIDEx), 64-bit hooking fixes
+
+### [23.05.2024]
+* Integration of [rat_king_parser](https://github.com/jeFF0Falltrades/rat_king_parser) by @jeFF0Falltrades
+    * Requires `dnfile` upgrade. We can't update it in `pyporject` due to `flare-capa`.
+        * Upgrade `dnfile` by yourself by running: `poetry run pip3 install -U dnfile`
+
+### [22.05.2024]
+* Monitor update: Enhance DnsQuery* hooks to capture DNS server lists (e.g. Socks5Systemz)
+* Socks5Systemz detection & config extraction
+
+### [21.05.2024]
+* Monitor update: Hook full set of service APIs in sechost.dll
+
+### [20.05.2024]
+* YARA-X support - https://virustotal.github.io/yara-x/
+* Monitor update: Debugger fixes/improvements, misc other fixes (see capemon repo for details)
+
+### [11.04.2024]
+* Monitor updates:
+    * YARA upgrade to 4.5.0 (& disabled assertion dialogs)
+    * Enable 64-bit 'native' hooks to avoid SSN overwriting
+    * Expand YARA options to allow offsets relative to the end of a pattern to be specified using asterisk (e.g. bp0=$code*+6)
+
+### [25.03.2024]
+* Bypass for variant of Heaven's Gate direct syscall seen in ecrime loader
+* Monitor updates: misc fixes (see capemon repo for details)
+
+### [20.03.2024]
+* Formbook: ntdll remap bypass & config extraction updates
+* Monitor update: Trace GetRegister() tweak
+
+### [15.03.2024]
+* Monitor update: Further unpacker refinement: Improve filter for unwanted .NET payloads to avoid missing interesting payloads
+
+### [14.03.2024]
+* Monitor update: Unpacker refinement for e.g. Shikata Ga Nai - thanks @para0x0dise
+
+### [12.03.2024]
+* Monitor update: Initial IPv6 support - thanks @cccs-mog
+* Linux support details can be seen in this [Pull Request](https://github.com/kevoreilly/CAPEv2/pull/2001)
+* We remove all `x.conf` to finish the mess with the configs.
+    * DO NOT EDIT `.conf.default` files. cape2.sh makes a copy of them removing `.default`.
+    * If you don't use `cape2.sh`.
+        * Run: `for filename in conf/default/*.conf.default; do cp -vf "./$filename" "./$(echo "$filename" | sed -e 's/.default//g' | sed -e 's/default//g')";  done`
+
+### [07.03.2024]
+* Monitor updates:
+    * Countermeasure for NtCreateUserProcess block-non-Microsoft-DLLs mitigation policy affecting monitoring
+    * Expand 'syscall' breakpoints to handle indirect syscalls (sysbpmode=1)
+    * Small fixes & improvements
+* Pikabot detection update & anti-hook bypass
+
+### [29.02.2024]
+* TLP fields added to distributed database. Requires db upgrade: `cd utils/db_migration_db && alembic upgrade head`
+* Monitor fixes
+
+### [28.02.2024]
+* Add 'ShellWindows' COM object injection mechanism (e.g. Latrodectus MSIs)
+* Monitor: add option to disable ntdll remap protection: ntdll-remap=0
+* Lumma direct systenter unmap crash bypass
+
+### [26.02.2024]
+* Monitor updates: Service injection delay for e.g. msi detonation & EnumDisplayDevices hooks & anti-vm (thanks @enzo)
+* Updated DarkGate config & payload extraction (thanks @enzo)
+* Latrodectus auto-export selection
+
+### [23.02.2024]
+* Monitor updates: Debugger/Trace enhancements
+
+### [14.02.2024]
+* Monitor update: Protect NtFreeVirtualMemory hook against spurious pointer values (e.g. f4bb0089dcf3629b1570fda839ef2f06c29cbf846c5134755d22d419015c8bd2)
+
+### [08.02.2024] CAPA 7 + CAPE
+* [CAPA](https://github.com/mandiant/capa) allows to generate a summary of CAPE's analysis. This gives quick abstract summary of analysis. More details [CAPA v7 blogpost](https://www.mandiant.com/resources/blog/dynamic-capa-executable-behavior-cape-sandbox)
+* Monitor update: Fix logging bug causing rare buffer overflows (e.g. 780be7a70ce3567ef268f6c768fc5a3d2510310c603bf481ebffd65e4fe95ff3)
+
+### [05.02.2024]
+* PhemedroneStealer config extractor - thanks @tccontre18 - Br3akp0int
+
+### [31.01.2024]
+* Monitor update: Protect 64-bit hooks against unaligned stack (e.g. 780be7a70ce3567ef268f6c768fc5a3d2510310c603bf481ebffd65e4fe95ff3)
+
+### [24.01.2024]
+* Monitor update: Improve handling of irregularly mapped PE images (e.g. from 7911e39e07995e3afb97ac0e5a4608c10c2e278bef29924ecc3924edfcc495ca)
+
+### [23.01.2024]
+* Monitor updates:
+    * PE dumping refinements for small PEs
+    * Debugger: don't trace rundll32 entry point for dlls submitted with bpX=ep
+
+### [18.01.2024]
+* Monitor update: Harden against volatile register anti-hook technique in e.g. AgentTesla (thanks @ClaudioWayne)
+
+### [10.01.2024]
+* Monitor updates:
+    * Further process dump filter hardening
+    * Fix dotnet cache dumps
+
+### [05.01.2024]
+* Monitor updates: fix a couple of issues affecting detonation (see capemon repo for details)
+
+### [08.12.2023]
+* Monitor updates:
+    * Expand procdump config option to allow forced procdumps irrespective of code section changes (procdump=2)
+    * Improve dumping of images with missing section addresses (e.g. VMP)
+
+### [07.12.2023]
+* Monitor update: fix bug in dumping malformed PEs
+
+### [05.12.2023]
+* Monitor updates:
+    * Process dump filter enhancements & fix
+    * Enhanced checks (parent process path) for service hookset assignment
+    * Misc fixes
+
+### [04.12.2023] IPinfo.io database integration
+* Introduce support for IPinfo.io database. You can download database [here](https://ipinfo.io/account/data-downloads).
+* To enable it:
+    * `conf/processing.conf` -> `network` -> `country_lookup = yes` and point `maxmind_database` to proper file.
+
+### [30.11.2023]
+* Monitor update: Fix bug affecting some process dumps
+
+### [29.11.2023] Unify download services
+* Virustotal config moved from `auxiliary.conf` to `web.conf` under `download_services`
+
+### [24.11.2023]
+* AsyncRAT config parser overhaul
+* Monitor update: Debugger tweaks
+
+### [17.11.2023]
+* Monitor update: Debugger fixes & enhancements (action target registers can be pointers when within [], e.g. action2=string:[esp])
+
+### [14.11.2023]
+* Monitor update: Small detonation fix
+* Formbook detonation & config tweaks
+
+### [7.11.2023]
+* Monitor updates: Misc debugger tweaks
+* XWorm config extraction
+
+### [3.11.2023]
+* Monitor updates:
+    * New debugger actions: 'setsrc' & 'setdst' to set values pointed at by instruction operands
+    * Improve filtering of uninteresting process dumps
+    * Misc fixes/improvements
+
+### [1.11.2023] ZPAQ Support
+* __ACTION REQUIRED__
+    * `sudo apt install zpaq`
+    * as cape user: `poetry install`
+
+### [20.10.2023]
+* Monitor fixes: address new issue affecting procdump and add check in compileMethod hook
+
+### [19.10.2023]
+* Monitor update:
+    * Unpacker: reduce/filter unwanted .NET payloads
+
+### [13.10.2023]
+* Formbook updates
+* Monitor updates:
+    * NtContinueEx hook
+    * Debugger action enhancements: setptr, patch, sleep, exit
+    * Software breakpoint handler enhancement
+    * Misc fixes/improvements
+
+### [11.10.2023]
+* Formbook config extraction
+* Monitor updates:
+    * GetComputerNameExW hook added, PostThreadMessage hook enhancement
+    * Debugger action enhancements
+    * Misc fixes
+
+### Download files matched by YARA
+* When doing search by `capeyara` we expose button to download files that only matches that search criteria.
+    * For [@fumik0_](https://twitter.com/fumik0_) with love.
+
+### [22.9.2023] CSRF changes
+* __IMPORTANT__. If you using __https__ please update config to use new field for __CSRF__ in `conf/web.conf`.
+    * Before: `[general]` -> `hostname`.
+    * Now: `[security]` -> `csrf_trusted_origins`
+
+### [19.9.2023]
+* Storage of file data in MongoDB
+    * Store the parts of a report's file data that is independent of a detonation in a separate collection
+      to conserve disk space.
+* __ACTION REQUIRED__
+    * It is recommended to add a regular cron job to call `cd /opt/CAPEv2 && sudo -u cape poetry run python ./utils/cleaners.py --delete-unused-file-data-in-mongo`
+      to prune these entries that are no longer needed.
+
+### [13.9.2023]
+* Monitor updates:
+    * .NET JIT native cache handling improvements
+    * New debugger action 'string' to capture decrypted strings
+    * Fix issue in procname_watch_init() with non-null-terminated unicode paths - thanks Proofpoint for the report
+
+### [8.9.2023]
+* Monitor update:
+    * .NET JIT native cache scanning & dumping
+
+### [1.9.2023]
+* Monitor updates:
+    * Fix missing browser hooks config setting for Edge & Chrome
+    * Trace: add config option to try and skip loops which flood trace logs (loopskip=1)
+
+### [25.8.2023]
+* Monitor update: Upgrade monitor Yara to 4.3.2 (thanks Michael Weiser)
+
+### [19.8.2023]
+* Monitor update: fix memcpy hook logging issue
+
 ### [16.8.2023]
 * Monitor updates:
     * Filter uninteresting process dumps via new VerifyCodeSection() function checking code section for modification
     * Fix issue with process path-based options being set too late (after yara init)
+    * YaraScan: do not call SetInitialBreakpoints() unless DebuggerInitialised flag is set
 
 ### [10.8.2023]
 * Monitor updates:
@@ -732,10 +1009,10 @@ db.createUser(
     * __REQUIRED ACTION:__ -> `poetry run pip install ujson -U`
 
 
-### [23-03-2021] API Suscription
+### [23-03-2021] API Subscription
 * Default 5/m, it can be changed using Django Admin in user profile. ratelimit is deprecated
 * This was done with huge help from those writeups
-    - [How to add susctiption based throtting to django](https://dev.to/mattschwartz/how-to-add-subscription-based-throttling-to-a-django-api-28j0)
+    - [How to add subscription based throtting to django](https://dev.to/mattschwartz/how-to-add-subscription-based-throttling-to-a-django-api-28j0)
     - [How to add custom fields to user profile](https://simpleisbetterthancomplex.com/tutorial/2016/11/23/how-to-add-user-profile-to-django-admin.html)
 
 * __REQUIRED ACTION:__ -> `cd web && python3 manage.py migrate`

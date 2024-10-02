@@ -21,6 +21,12 @@ log = logging.getLogger(__name__)
 cfg = Config()
 router_cfg = Config("routing")
 
+physical_machinery = False
+if cfg.cuckoo.machinery == "physical":
+    physical_cfg = Config("physical")
+    fog_Host = physical_cfg.fog.hostname
+    physical_machinery = True
+
 
 class Sniffer(Auxiliary):
     sudo_path = "/usr/bin/sudo"
@@ -35,9 +41,18 @@ class Sniffer(Auxiliary):
 
         # Get updated machine info
         self.machine = self.db.view_machine_by_label(self.machine.label)
-        tcpdump = self.options.get("tcpdump", "/usr/sbin/tcpdump")
+
+        # I got tired of Ubuntu's renaming
+        tcpdump = self.options.get("tcpdump", "/usr/bin/tcpdump")
+        if not os.path.exists(tcpdump):
+            for path in ["/usr/bin/tcpdump", "/usr/sbin/tcpdump"]:
+                if os.path.exists(path):
+                    tcpdump = path
+                    break
+
         bpf = self.options.get("bpf", "")
         remote = self.options.get("remote", False)
+        custom = self.options.get("custom", "")
         remote_host = self.options.get("host", "")
         file_path = (
             f"/tmp/tcp.dump.{self.task.id}"
@@ -153,9 +168,13 @@ class Sniffer(Auxiliary):
                 ")",
             ]
         )
-
+        if physical_machinery:
+            # Do not capture FOG Server traffic.
+            pargs.extend(["and", "not", "(", "dst", "host", fog_Host, ")"])
         # TODO fix this, temp fix to not get all that noise
         # pargs.extend(["and", "not", "(", "dst", "host", resultserver_ip, "and", "src", "host", host, ")"])
+        if custom:
+            pargs.extend(["and", "(", *custom.split(" "), ")", "'"])
 
         if remote and bpf:
             pargs.extend(["and", "(", *bpf.split(" "), ")", "'"])
@@ -244,7 +263,7 @@ class Sniffer(Auxiliary):
                 term_func()
                 _, _ = self.proc.communicate()
             except Exception as e:
-                log.exception("Unable to stop the sniffer (first try) with pid %d: %s", pid, e)
+                log.error("Unable to stop the sniffer (first try) with pid %d: %s", pid, e)
                 try:
                     if not self.proc.poll():
                         log.debug("Killing sniffer")

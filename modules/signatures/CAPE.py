@@ -270,7 +270,7 @@ class CAPE_InjectionProcessHollowing(Signature):
             self.thread_map = {}
             self.lastprocess = process
 
-        if process.get("process_name") in ("acrord32.exe",):
+        if process.get("process_name").lower() in ("acrord32.exe",):
             return False
 
         if call["api"] == "CreateProcessInternalW":
@@ -592,7 +592,7 @@ class CAPE_TransactedHollowing(Signature):
 class CAPEDetectedThreat(Signature):
     name = "cape_detected_threat"
     description = "CAPE detected a specific malware threat"
-    severity = 3
+    severity = 6
     categories = ["malware"]
     authors = ["Kevin Ross"]
     minimum = "1.3"

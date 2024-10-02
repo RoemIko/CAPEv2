@@ -12,8 +12,9 @@ if os.path.exists(ttps_map_file):
     except Exception as e:
         print("Can't load TTPs.json file", e)
 
+
 # Read the config file
-def mapTTP(oldTTPs: list):
+def mapTTP(oldTTPs: list, mbcs: list):
     ttpsList = []
     grouped_ttps = defaultdict(list)
 
@@ -28,4 +29,7 @@ def mapTTP(oldTTPs: list):
     for item in ttpsList:
         grouped_ttps[item["signature"]].append(item["ttp"])
 
-    return [{"signature": signature, "ttps": list(dict.fromkeys(ttps))} for signature, ttps in grouped_ttps.items()]
+    return [
+        {"signature": signature, "ttps": list(dict.fromkeys(ttps)), "mbcs": mbcs.get(signature, [])}
+        for signature, ttps in grouped_ttps.items()
+    ]

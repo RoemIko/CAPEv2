@@ -9,9 +9,13 @@ import shutil
 
 from lib.common.abstracts import Package
 from lib.common.common import check_file_extension
+from lib.common.constants import DLL_OPTION_TEXT, DLL_OPTIONS, OPT_ARGUMENTS, OPT_DLLLOADER, OPT_FUNCTION
 
 log = logging.getLogger(__name__)
 
+_OPT_ENABLE_MULTI = "enable_multi"
+_OPT_MAX_DLL_EXPORTS = "max_dll_exports"
+_OPT_USE_EXPORT_NAME = "use_export_name"
 MAX_DLL_EXPORTS_DEFAULT = 8
 
 
@@ -21,11 +25,33 @@ class Dll(Package):
     PATHS = [
         ("SystemRoot", "System32", "rundll32.exe"),
     ]
+    summary = "Executes a .DLL file using rundll32.exe."
+    description = f"""Uses rundll32.exe to execute a function or functions in the DLL file.
+    {DLL_OPTION_TEXT}
+
+    Functions to execute may be specified by number, the default is '#1'.
+    Use the '{_OPT_ENABLE_MULTI}' option if multiple functions should be executed.
+    Function numbers should be separated by a colon, for example: '#1:#3:#5'.
+    A range of functions can be specified, for example: '#1..3' or '#2-4'
+
+    Functions to execute may be specified by name, if the '{_OPT_USE_EXPORT_NAME}' option is True.
+    The default function name is 'DllMain'
+    Specify the '{_OPT_ENABLE_MULTI}' option if multiple functions should be executed.
+    Function names should be separated by a colon, for example: 'func1:func2'.
+
+    When '{_OPT_ENABLE_MULTI}' is used and function names are not specified, attempt to identify exported functions.
+    If no exported function names were available, default to 'DllMain' and 'DllRegisterServer'.
+
+    By default, at most {MAX_DLL_EXPORTS_DEFAULT} functions will be executed; use the option
+    '{_OPT_MAX_DLL_EXPORTS}' to set a different limit.
+
+    The .dll filename extension will be added to the sample name automatically."""
+    option_names = sorted(set(DLL_OPTIONS + (_OPT_ENABLE_MULTI, _OPT_USE_EXPORT_NAME, _OPT_MAX_DLL_EXPORTS)))
 
     def start(self, path):
         rundll32 = self.get_path("rundll32.exe")
-        arguments = self.options.get("arguments", "")
-        dllloader = self.options.get("dllloader")
+        arguments = self.options.get(OPT_ARGUMENTS, "")
+        dllloader = self.options.get(OPT_DLLLOADER)
 
         # If the file doesn't have the proper .dll extension force it
         # and rename it. This is needed for rundll32 to execute correctly.
@@ -38,17 +64,17 @@ class Dll(Package):
             rundll32 = newname
 
         # If user has requested we use something (function, functions, ordinal, ordinal range)
-        function = self.options.get("function")
+        function = self.options.get(OPT_FUNCTION)
 
         # Does the user want us to run multiple exports that are available?
-        enable_multi = self.options.get("enable_multi", "")
+        enable_multi = self.options.get(_OPT_ENABLE_MULTI, "")
         if enable_multi.lower() in ("on", "yes", "true"):
             enable_multi = True
         else:
             enable_multi = False
 
         # Does the user want us to run multiple exports by name?
-        use_export_name = self.options.get("use_export_name", "")
+        use_export_name = self.options.get(_OPT_USE_EXPORT_NAME, "")
         if use_export_name.lower() in ("on", "yes", "true"):
             use_export_name = True
         else:
@@ -57,6 +83,8 @@ class Dll(Package):
         run_ordinal_range = False
         run_multiple_functions = False
 
+        max_dll_exports = None
+        available_exports = []
         if function:
             # If user has requested we use functions (by name or by ordinal number), separated by colon
             if enable_multi and ":" in function:
@@ -69,7 +97,7 @@ class Dll(Package):
 
             # If the user has not enabled multi, but requested multiple functions, log it and default to #1
             elif not enable_multi and (":" in function or "-" in function or ".." in function):
-                log.warning("You need to enable the `enable_multi` option if you want to run multiple functions.")
+                log.warning(f"You need to enable the `{_OPT_ENABLE_MULTI}` option if you want to run multiple functions.")
                 # Setting function to the first ordinal number since the user does not want use to run multiple functions.
                 function = "#1"
 
@@ -97,7 +125,7 @@ class Dll(Package):
 
                 # If there are available exports, set limit and determine if we are to use name or number
                 else:
-                    max_dll_exports = int(self.options.get("max_dll_exports", MAX_DLL_EXPORTS_DEFAULT))
+                    max_dll_exports = int(self.options.get(_OPT_MAX_DLL_EXPORTS, MAX_DLL_EXPORTS_DEFAULT))
                     if max_dll_exports <= 0:
                         max_dll_exports = MAX_DLL_EXPORTS_DEFAULT
                     dll_exports_num = min(len(available_exports), max_dll_exports)
@@ -112,12 +140,23 @@ class Dll(Package):
         # To get to this stage, the user has enabled `enable_multi`, and has either specified an ordinal
         # range or requested that we use available exports by ordinal number, up to a limit
         if run_ordinal_range:
+            ret_list = []
             with contextlib.suppress(ValueError, AssertionError):
                 start, end = (int(_.lstrip("#")) for _ in function.replace("..", "-").split("-", 1))
                 assert start < end
-                args = '/c for /l %i in ({start},1,{end}) do @{rundll32} "{path}",#%i {arguments}'.format(**locals())
-                # if there are multiple functions launch them by their ordinal number in a for loop via cmd.exe calling rundll32.exe
-                return self.execute("C:\\Windows\\System32\\cmd.exe", args.strip(), path)
+                # if there are more exports than max_dll_exports we still want to run the last export
+                if max_dll_exports and len(available_exports) > max_dll_exports:
+                    end -= 1
+                    args = f'"{path}",#{len(available_exports)}'
+                    if arguments:
+                        args += f" {arguments}"
+                    ret_list.append(self.execute(rundll32, args, path))
+                # if there are multiple functions launch them by their ordinal number in a for loop
+                for i in range(start, end + 1, 1):
+                    args = f'"{path}",#{i}'
+                    if arguments:
+                        args += f" {arguments}"
+                    ret_list.append(self.execute(rundll32, args, path))
 
         # To get to this stage, the user has enabled `enable_multi`, and has either specified a list of function names
         # or requested that we use available exports by name, up to a limit

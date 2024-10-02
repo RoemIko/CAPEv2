@@ -158,7 +158,7 @@ def flare_capa_attck(obj, *args, **kwargs):
     _print(3, "<tbody>\n")
     for tactic, techniques in obj.get("ATTCK", {}).items():
         _print(4, "<tr>\n")
-        _print(4, '<th scope="row">' + tactic + "</th>\n")
+        _print(4, '<th width="25%" scope="row">' + tactic + "</th>\n")
         _print(4, "<td>\n")
         for technique in techniques:
             _print(5, "<li>" + technique + "</li>\n")
@@ -190,7 +190,7 @@ def flare_capa_mbc(obj, *args, **kwargs):
     _print(3, "<tbody>\n")
     for objective, behaviors in obj.get("MBC", {}).items():
         _print(4, "<tr>\n")
-        _print(4, '<th scope="row">' + objective + "</th>\n")
+        _print(4, '<th width="25%" scope="row">' + objective + "</th>\n")
         _print(4, "<td>\n")
         for behavior in behaviors:
             _print(5, "<li>" + behavior + "</li>\n")
@@ -242,7 +242,7 @@ def malware_config(obj, *args, **kwargs):
             else:
                 result.write(malware_config(obj[0]))
     else:
-        result.write('<pre style="margin: 0">' + escape(str(obj)) + "</pre>")
+        result.write(escape(str(obj)))
 
     ret_result = result.getvalue()
     result.close()

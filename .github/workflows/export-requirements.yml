@@ -9,33 +9,33 @@ on:
 
 jobs:
   update:
+    if: ${{ !github.event.act }} # skip during local actions testing
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
       matrix:
-        python-version: ["3.8"]
+        python-version: ["3.10"]
 
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Install poetry
+        run: pip install poetry
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v5
         with:
+          # check-latest: true
           python-version: ${{ matrix.python-version }}
-
-      - name: Install Poetry
-        uses: snok/install-poetry@v1
-        with:
-          installation-arguments: --git https://github.com/python-poetry/poetry.git@fedff6da43f33a350598ec0ea85b5dca30178a03 # 1.5.1
-          virtualenvs-create: true
-          virtualenvs-in-project: true
-          installer-parallel: true
+          cache: 'poetry'
 
       - name: Export requirements.txt
         run: poetry export --format requirements.txt --output requirements.txt
 
       - name: Commit changes if any
+        # Skip this step if being run by nektos/act
+        if: ${{ !env.ACT }}
         run: |
           git config user.name "GitHub Actions"
           git config user.email "action@github.com"
