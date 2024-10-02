@@ -32,7 +32,7 @@ try:
     HAVE_CRYPTO = True
 except ImportError:
     HAVE_CRYPTO = False
-    print("Missed cryptography library: pip3 install -U cryptography")
+    print("Missed cryptography library: poetry install")
 
 try:
     import magic
@@ -342,7 +342,7 @@ class PortableExecutable:
                                     }
                                 )
             except pefile.PEFormatError as e:
-                log.error("get_resources error: %s", str(e))
+                log.debug("get_resources error: %s", str(e))
             except Exception as e:
                 log.error(e, exc_info=True)
                 continue
@@ -545,7 +545,7 @@ class PortableExecutable:
 
     def generate_icon_dhash(self, image: Image.Image, hash_size: int = 8) -> str:
         # based on https://gist.github.com/fr0gger/1263395ebdaf53e67f42c201635f256c
-        image = image.convert("L").resize((hash_size + 1, hash_size), Image.ANTIALIAS)
+        image = image.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
 
         difference = []
 
@@ -578,13 +578,16 @@ class PortableExecutable:
             idx = [entry.id for entry in pe.DIRECTORY_ENTRY_RESOURCE.entries]
             if pefile.RESOURCE_TYPE["RT_GROUP_ICON"] not in idx:
                 return None, None, None, None
-
-            rt_group_icon_idx = idx.index(pefile.RESOURCE_TYPE["RT_GROUP_ICON"])
-            rt_group_icon_dir = pe.DIRECTORY_ENTRY_RESOURCE.entries[rt_group_icon_idx]
-            entry = rt_group_icon_dir.directory.entries[0]
-            offset = entry.directory.entries[0].data.struct.OffsetToData
-            size = entry.directory.entries[0].data.struct.Size
-            peicon = PEGroupIconDir(pe.get_memory_mapped_image()[offset : offset + size])
+            try:
+                rt_group_icon_idx = idx.index(pefile.RESOURCE_TYPE["RT_GROUP_ICON"])
+                rt_group_icon_dir = pe.DIRECTORY_ENTRY_RESOURCE.entries[rt_group_icon_idx]
+                entry = rt_group_icon_dir.directory.entries[0]
+                offset = entry.directory.entries[0].data.struct.OffsetToData
+                size = entry.directory.entries[0].data.struct.Size
+                peicon = PEGroupIconDir(pe.get_memory_mapped_image()[offset : offset + size])
+            except Exception as e:
+                log.error(e)
+                return None, None, None, None
             bigwidth = 0
             bigheight = 0
             bigbpp = 0
@@ -727,9 +730,7 @@ class PortableExecutable:
             return []
 
         if not HAVE_CRYPTO:
-            log.critical(
-                "You do not have the cryptography library installed preventing certificate extraction. pip3 install cryptography"
-            )
+            log.critical("You do not have the cryptography library installed preventing certificate extraction. poetry install")
             return []
 
         dir_index = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]
@@ -759,7 +760,7 @@ class PortableExecutable:
                 certs = backend.load_der_pkcs7_certificates(signatures)
 
         except AttributeError:
-            log.error("Can't get PE signatures")
+            log.debug("Can't get PE signatures")
 
         for cert in certs:
             md5 = binascii.hexlify(cert.fingerprint(hashes.MD5())).decode()

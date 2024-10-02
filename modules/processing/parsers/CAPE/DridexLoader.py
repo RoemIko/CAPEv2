@@ -14,6 +14,7 @@
 
 import socket
 import struct
+from contextlib import suppress
 
 import pefile
 import yara
@@ -53,6 +54,8 @@ yara_rules = yara.compile(source=rule_source)
 
 
 def decrypt_rc4(key, data):
+    if not key:
+        return b""
     cipher = ARC4.new(key)
     return cipher.decrypt(data)
 
@@ -110,11 +113,17 @@ def extract_config(filebuf):
     else:
         return
 
-    c2_offset = pe.get_offset_from_rva(c2_rva)
+    try:
+        c2_offset = pe.get_offset_from_rva(c2_rva)
+    except pefile.PEFormatError:
+        return
 
+    num_ips = 0
     if num_ips_rva:
         num_ips_offset = pe.get_offset_from_rva(num_ips_rva)
-        num_ips = struct.unpack("B", filebuf[num_ips_offset : num_ips_offset + 1])[0]
+        ip_data = filebuf[num_ips_offset : num_ips_offset + 1]
+        if ip_data:
+            num_ips = struct.unpack("B", filebuf[num_ips_offset : num_ips_offset + 1])[0]
 
     for _ in range(num_ips):
         ip = struct.unpack(">I", filebuf[c2_offset : c2_offset + 4])[0]
@@ -150,11 +159,12 @@ def extract_config(filebuf):
     if botnet_code:
         botnet_rva = struct.unpack("i", filebuf[botnet_code + 23 : botnet_code + 27])[0] - image_base
     if botnet_rva:
-        botnet_offset = pe.get_offset_from_rva(botnet_rva)
-        botnet_id = struct.unpack("H", filebuf[botnet_offset : botnet_offset + 2])[0]
-        cfg["Botnet ID"] = str(botnet_id)
+        with suppress(struct.error):
+            botnet_offset = pe.get_offset_from_rva(botnet_rva)
+            botnet_id = struct.unpack("H", filebuf[botnet_offset : botnet_offset + 2])[0]
+            cfg["Botnet ID"] = str(botnet_id)
 
-        return cfg
+    return cfg
 
 
 if __name__ == "__main__":

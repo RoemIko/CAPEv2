@@ -7,10 +7,10 @@ import collections
 import datetime
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import zipfile
-import zlib
 from contextlib import suppress
 from io import BytesIO
 from pathlib import Path
@@ -32,7 +32,7 @@ import modules.processing.network as network
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import ANALYSIS_BASE_PATH, CUCKOO_ROOT
 from lib.cuckoo.common.path_utils import path_exists, path_get_size, path_mkdir, path_read_file, path_safe
-from lib.cuckoo.common.utils import delete_folder
+from lib.cuckoo.common.utils import delete_folder, yara_detected
 from lib.cuckoo.common.web_utils import category_all_files, my_rate_minutes, my_rate_seconds, perform_search, rateblock, statistics
 from lib.cuckoo.core.database import TASK_PENDING, Database, Task
 from modules.reporting.report_doc import CHUNK_CALL_SIZE
@@ -43,7 +43,7 @@ except ImportError:
     try:
         from ratelimit.decorators import ratelimit
     except ImportError:
-        print("missed dependency: poetry run pip install django-ratelimit -U")
+        print("missed dependency: poetry install")
 
 from lib.cuckoo.common.webadmin_utils import disable_user
 
@@ -64,7 +64,7 @@ try:
 
     HAVE_PYZIPPER = True
 except ImportError:
-    print("Missed dependency: poetry run pip install pyzipper -U")
+    print("Missed dependency: poetry install")
     HAVE_PYZIPPER = False
 
 TASK_LIMIT = 25
@@ -117,6 +117,10 @@ HAVE_FLOSS = False
 if processing_cfg.floss.on_demand:
     from lib.cuckoo.common.integrations.floss import HAVE_FLOSS, Floss
 
+USE_SEVENZIP = False
+if reporting_cfg.compression.compressiontool == "7zip":
+    USE_SEVENZIP = True
+    SEVENZIP_PATH = reporting_cfg.compression.sevenzippath.strip() or "/usr/bin/7z"
 
 # Used for displaying enabled config options in Django UI
 enabledconf = {}
@@ -149,6 +153,11 @@ if enabledconf["elasticsearchdb"]:
 
     es = elastic_handler
 
+DISABLED_WEB = True
+# if elif else won't work here
+if enabledconf["mongodb"] or enabledconf["elasticsearchdb"]:
+    DISABLED_WEB = False
+
 db = Database()
 
 anon_not_viewable_func_list = (
@@ -174,6 +183,13 @@ class conditional_login_required:
         if not self.condition:
             return func
         return self.decorator(func)
+
+
+def _path_safe(path: str) -> bool:
+    if web_cfg.security.check_path_safe:
+        return path_safe(path)
+
+    return True
 
 
 def get_tags_tasks(task_ids: list) -> str:
@@ -216,6 +232,7 @@ def get_analysis_info(db, id=-1, task=None):
             {
                 "info": 1,
                 "target.file.virustotal.summary": 1,
+                "url.virustotal.summary": 1,
                 "malscore": 1,
                 "detections": 1,
                 "network.pcap_sha256": 1,
@@ -239,6 +256,7 @@ def get_analysis_info(db, id=-1, task=None):
             _source=[
                 "info",
                 "target.file.virustotal.summary",
+                "url.virustotal.summary",
                 "malscore",
                 "detections",
                 "network.pcap_sha256",
@@ -294,6 +312,9 @@ def get_analysis_info(db, id=-1, task=None):
                     new[keyword] = rtmp["info"]["target"][keyword]
             if rtmp["target"]["file"].get("virustotal", {}).get("summary", False):
                 new["virustotal_summary"] = rtmp["target"]["file"]["virustotal"]["summary"]
+
+        if rtmp.get("url", {}).get("virustotal", {}).get("summary", False):
+            new["virustotal_summary"] = rtmp["url"]["virustotal"]["summary"]
 
         if settings.MOLOCH_ENABLED:
             if settings.MOLOCH_BASE[-1] != "/":
@@ -494,7 +515,7 @@ def index(request, page=1):
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def pending(request):
-    db = Database()
+    # db = Database()
     tasks = db.list_tasks(status=TASK_PENDING)
 
     pending = []
@@ -530,7 +551,7 @@ def _load_file(task_id, sha256, existen_details, name):
 
     elif name == "debugger":
         debugger_log_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "debugger")
-        if path_exists(debugger_log_path) and path_safe(debugger_log_path):
+        if path_exists(debugger_log_path) and _path_safe(debugger_log_path):
             for log in os.listdir(debugger_log_path):
                 if not log.endswith(".log"):
                     continue
@@ -540,7 +561,7 @@ def _load_file(task_id, sha256, existen_details, name):
         return existen_details
 
     if name in ("bingraph", "vba2graph"):
-        if not filepath or not path_exists(filepath) or not path_safe(filepath):
+        if not filepath or not path_exists(filepath) or not _path_safe(filepath):
             return existen_details
 
         existen_details.setdefault(sha256, Path(filepath).read_text())
@@ -557,14 +578,25 @@ def load_files(request, task_id, category):
     @param task_id: cuckoo task id
     """
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
-    if is_ajax and category in ("CAPE", "dropped", "behavior", "debugger", "network", "procdump", "procmemory", "memory"):
+    if is_ajax and category in (
+        "CAPE",
+        "dropped",
+        "behavior",
+        "strace",
+        "debugger",
+        "network",
+        "procdump",
+        "procmemory",
+        "memory",
+        "tracee",
+    ):
         data = {}
         debugger_logs = {}
         bingraph_dict_content = {}
         vba2graph_dict_content = {}
         # Search calls related to your PID.
         if enabledconf["mongodb"]:
-            if category in ("behavior", "debugger"):
+            if category in ("behavior", "debugger", "strace"):
                 data = mongo_find_one(
                     "analysis",
                     {"info.id": int(task_id)},
@@ -572,9 +604,86 @@ def load_files(request, task_id, category):
                 )
                 if category == "debugger":
                     data["debugger"] = data["behavior"]
+                if category == "strace":
+                    data["strace"] = data["behavior"]
+            elif category == "tracee":
+                data = mongo_find_one("analysis", {"info.id": int(task_id)}, {category: 1, "info.tlp": 1, "_id": 0})
+                tmp = data["tracee"]
+                data["tracee"] = {}
+                data["tracee"]["rawData"] = tmp
+                with open("/opt/CAPEv2/data/linux/linux-syscalls.json", "r") as f:
+                    data["tracee"]["syscalls_decoded"] = json.load(f)
+                    data["tracee"]["syscalls_decoded"]["syscalls"].extend(
+                        [
+                            {"name": "stdio_over_socket", "cat": "SIGNATURISED"},
+                            {"name": "k8s_api_connection", "cat": "SIGNATURISED"},
+                            {"name": "aslr_inspection", "cat": "SIGNATURISED"},
+                            {"name": "proc_mem_code_injection", "cat": "SIGNATURISED"},
+                            {"name": "docker_abuse", "cat": "SIGNATURISED"},
+                            {"name": "scheduled_task_mod", "cat": "SIGNATURISED"},
+                            {"name": "ld_preload", "cat": "SIGNATURISED"},
+                            {"name": "cgroup_notify_on_release", "cat": "SIGNATURISED"},
+                            {"name": "default_loader_mod", "cat": "SIGNATURISED"},
+                            {"name": "sudoers_modification", "cat": "SIGNATURISED"},
+                            {"name": "sched_debug_recon", "cat": "SIGNATURISED"},
+                            {"name": "system_request_key_mod", "cat": "SIGNATURISED"},
+                            {"name": "cgroup_release_agent", "cat": "SIGNATURISED"},
+                            {"name": "rcd_modification", "cat": "SIGNATURISED"},
+                            {"name": "core_pattern_modification", "cat": "SIGNATURISED"},
+                            {"name": "proc_kcore_read", "cat": "SIGNATURISED"},
+                            {"name": "proc_mem_access", "cat": "SIGNATURISED"},
+                            {"name": "hidden_file_created", "cat": "SIGNATURISED"},
+                            {"name": "anti_debugging", "cat": "SIGNATURISED"},
+                            {"name": "ptrace_code_injection", "cat": "SIGNATURISED"},
+                            {"name": "process_vm_write_inject", "cat": "SIGNATURISED"},
+                            {"name": "disk_mount", "cat": "SIGNATURISED"},
+                            {"name": "dynamic_code_loading", "cat": "SIGNATURISED"},
+                            {"name": "fileless_execution", "cat": "SIGNATURISED"},
+                            {"name": "illegitimate_shell", "cat": "SIGNATURISED"},
+                            {"name": "kernel_module_loading", "cat": "SIGNATURISED"},
+                            {"name": "k8s_cert_theft", "cat": "SIGNATURISED"},
+                            {"name": "proc_fops_hooking", "cat": "SIGNATURISED"},
+                            {"name": "syscall_hooking", "cat": "SIGNATURISED"},
+                            {"name": "dropped_executable", "cat": "SIGNATURISED"},
+                            {"name": "sched_debug_recon", "cat": "SIGNATURISED"},
+                            {"name": "sched_process_exec", "cat": "SIGNATURISED"},
+                            {"name": "security_inode_unlink", "cat": "SIGNATURISED"},
+                            {"name": "security_bpf_prog", "cat": "SIGNATURISED"},
+                            {"name": "security_socket_connect", "cat": "SIGNATURISED"},
+                            {"name": "security_socket_accept", "cat": "SIGNATURISED"},
+                            {"name": "security_socket_bind", "cat": "SIGNATURISED"},
+                            {"name": "security_sb_mount", "cat": "SIGNATURISED"},
+                            {"name": "net_packet_icmp", "cat": "SIGNATURISED"},
+                            {"name": "net_packet_icmpv6", "cat": "SIGNATURISED"},
+                            {"name": "net_packet_dns_request", "cat": "SIGNATURISED"},
+                            {"name": "net_packet_dns_response", "cat": "SIGNATURISED"},
+                            {"name": "net_packet_http_request", "cat": "SIGNATURISED"},
+                            {"name": "net_packet_http_response", "cat": "SIGNATURISED"},
+                            {"name": "process_vm_readv", "cat": "SIGNATURISED"},
+                            {"name": "process_vm_writev", "cat": "SIGNATURISED"},
+                            {"name": "finit_module", "cat": "SIGNATURISED"},
+                            {"name": "memfd_create", "cat": "SIGNATURISED"},
+                        ]
+                    )
+                data["tracee"]["syscalls"] = json.dumps(data["tracee"]["syscalls_decoded"])
+                data["tracee"]["cats"] = [
+                    "SIGNATURISED",
+                    "kernel",
+                    "fs",
+                    "mm",
+                    "net",
+                    "ipc",
+                    "security",
+                    "drivers",
+                    "io_uring",
+                    "crypto",
+                    "block",
+                ]
             elif category == "network":
                 data = mongo_find_one(
-                    "analysis", {"info.id": int(task_id)}, {category: 1, "info.tlp": 1, "cif": 1, "suricata": 1, "_id": 0}
+                    "analysis",
+                    {"info.id": int(task_id)},
+                    {category: 1, "info.tlp": 1, "cif": 1, "suricata": 1, "pcapng": 1, "_id": 0},
                 )
             else:
                 data = mongo_find_one("analysis", {"info.id": int(task_id)}, {category: 1, "info.tlp": 1, "_id": 0})
@@ -588,6 +697,8 @@ def load_files(request, task_id, category):
 
                 if category == "debugger":
                     data["debugger"] = data["behavior"]
+                if category == "strace":
+                    data["strace"] = data["behavior"]
             elif category == "network":
                 data = elastic_handler.search(
                     index=get_analysis_index(),
@@ -640,9 +751,10 @@ def load_files(request, task_id, category):
             ajax_response["domainlookups"] = {i["domain"]: i["ip"] for i in ajax_response.get("network", {}).get("domains", {})}
             ajax_response["suricata"] = data.get("suricata", {})
             ajax_response["cif"] = data.get("cif", [])
+            ajax_response["pcapng"] = data.get("pcapng", {})
             tls_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "tlsdump", "tlsdump.log")
-            if path_safe(tls_path):
-                ajax_response["tlskeys_exists"] = path_safe(tls_path)
+            if _path_safe(tls_path):
+                ajax_response["tlskeys_exists"] = _path_safe(tls_path)
         elif category == "behavior":
             ajax_response["detections2pid"] = data.get("detections2pid", {})
         return render(request, page, ajax_response)
@@ -755,7 +867,7 @@ def chunk(request, task_id, pid, pagenum):
             record = mongo_find_one(
                 "analysis",
                 {"info.id": int(task_id), "behavior.processes.process_id": pid},
-                {"behavior.processes.process_id": 1, "behavior.processes.calls": 1, "_id": 0},
+                {"info.machine.platform": 1, "behavior.processes.process_id": 1, "behavior.processes.calls": 1, "_id": 0},
             )
 
         if es_as_db:
@@ -766,7 +878,7 @@ def chunk(request, task_id, pid, pagenum):
                         "bool": {"must": [{"match": {"behavior.processes.process_id": pid}}, {"match": {"info.id": task_id}}]}
                     }
                 },
-                _source=["behavior.processes.process_id", "behavior.processes.calls"],
+                _source=["info.machine.platform", "behavior.processes.process_id", "behavior.processes.calls"],
             )["hits"]["hits"][0]["_source"]
 
         if not record:
@@ -793,7 +905,10 @@ def chunk(request, task_id, pid, pagenum):
         else:
             chunk = dict(calls=[])
 
-        return render(request, "analysis/behavior/_chunk.html", {"chunk": chunk})
+        if record["info"]["machine"].get("platform", "") == "linux":
+            return render(request, "analysis/strace/_chunk.html", {"chunk": chunk})
+        else:
+            return render(request, "analysis/behavior/_chunk.html", {"chunk": chunk})
     else:
         raise PermissionDenied
 
@@ -814,7 +929,7 @@ def filtered_chunk(request, task_id, pid, category, apilist, caller, tid):
             record = mongo_find_one(
                 "analysis",
                 {"info.id": int(task_id), "behavior.processes.process_id": int(pid)},
-                {"behavior.processes.process_id": 1, "behavior.processes.calls": 1, "_id": 0},
+                {"info.machine.platform": 1, "behavior.processes.process_id": 1, "behavior.processes.calls": 1, "_id": 0},
             )
         if es_as_db:
             record = es.search(
@@ -824,7 +939,7 @@ def filtered_chunk(request, task_id, pid, category, apilist, caller, tid):
                         "bool": {"must": [{"match": {"behavior.processes.process_id": pid}}, {"match": {"info.id": task_id}}]}
                     }
                 },
-                _source=["behavior.processes.process_id", "behavior.processes.calls"],
+                _source=["info.machine.platform", "behavior.processes.process_id", "behavior.processes.calls"],
             )["hits"]["hits"][0]["_source"]
 
         if not record:
@@ -865,7 +980,7 @@ def filtered_chunk(request, task_id, pid, category, apilist, caller, tid):
                     if len(apis) > 0:
                         add_call = -1
                         for api in apis:
-                            if call["api"].lower() == api:
+                            if api in call["api"].lower():
                                 if exclude:
                                     add_call = 0
                                 else:
@@ -876,7 +991,10 @@ def filtered_chunk(request, task_id, pid, category, apilist, caller, tid):
                     else:
                         filtered_process["calls"].append(call)
 
-        return render(request, "analysis/behavior/_chunk.html", {"chunk": filtered_process})
+        if record["info"]["machine"]["platform"] == "linux":
+            return render(request, "analysis/strace/_chunk.html", {"chunk": filtered_process})
+        else:
+            return render(request, "analysis/behavior/_chunk.html", {"chunk": filtered_process})
     else:
         raise PermissionDenied
 
@@ -1066,6 +1184,48 @@ def gen_moloch_from_antivirus(virustotal):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+def antivirus(request, task_id):
+    if enabledconf["mongodb"]:
+        rtmp = mongo_find_one(
+            "analysis",
+            {"info.id": int(task_id)},
+            {"target.file.virustotal": 1, "url.virustotal": 1, "info.category": 1, "_id": 0},
+            sort=[("_id", -1)],
+        )
+    elif es_as_db:
+        rtmp = es.search(index=get_analysis_index(), query=get_query_by_info_id(task_id), _source=["virustotal", "info.category"])[
+            "hits"
+        ]["hits"]
+        if len(rtmp) == 0:
+            rtmp = None
+        else:
+            rtmp = rtmp[0]["_source"]
+    else:
+        rtmp = None
+    if not rtmp:
+        return render(request, "error.html", {"error": "The specified analysis does not exist"})
+
+    if rtmp.get("target", {}).get("file"):
+        rtmp["virustotal"] = rtmp.get("target", {}).get("file", {}).get("virustotal")
+        del rtmp["target"]["file"]["virustotal"]
+    elif rtmp.get("url", {}).get("virustotal"):
+        rtmp["virustotal"] = rtmp.get("url", {}).get("virustotal")
+        del rtmp["url"]["virustotal"]
+
+    if settings.MOLOCH_ENABLED:
+        if settings.MOLOCH_BASE[-1] != "/":
+            settings.MOLOCH_BASE += "/"
+        if "virustotal" in rtmp:
+            rtmp["virustotal"] = gen_moloch_from_antivirus(rtmp["virustotal"])
+
+    rtmp.setdefault("file", {}).setdefault("virustotal", rtmp["virustotal"])
+    del rtmp["virustotal"]
+
+    return render(request, "analysis/antivirus.html", rtmp)
+
+
+@require_safe
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def surialert(request, task_id):
     if enabledconf["mongodb"]:
         report = mongo_find_one("analysis", {"info.id": int(task_id)}, {"suricata.alerts": 1, "_id": 0}, sort=[("_id", -1)])
@@ -1214,34 +1374,6 @@ def surifiles(request, task_id):
     return render(request, "analysis/surifiles.html", {"analysis": report["suricata"], "config": enabledconf})
 
 
-@require_safe
-@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
-def antivirus(request, task_id):
-    if enabledconf["mongodb"]:
-        rtmp = mongo_find_one(
-            "analysis", {"info.id": int(task_id)}, {"virustotal": 1, "info.category": 1, "_id": 0}, sort=[("_id", -1)]
-        )
-    elif es_as_db:
-        rtmp = es.search(index=get_analysis_index(), query=get_query_by_info_id(task_id), _source=["virustotal", "info.category"])[
-            "hits"
-        ]["hits"]
-        if len(rtmp) == 0:
-            rtmp = None
-        else:
-            rtmp = rtmp[0]["_source"]
-    else:
-        rtmp = None
-    if not rtmp:
-        return render(request, "error.html", {"error": "The specified analysis does not exist"})
-    if settings.MOLOCH_ENABLED:
-        if settings.MOLOCH_BASE[-1] != "/":
-            settings.MOLOCH_BASE += "/"
-        if "virustotal" in rtmp:
-            rtmp["virustotal"] = gen_moloch_from_antivirus(rtmp["virustotal"])
-
-    return render(request, "analysis/antivirus.html", {"analysis": rtmp})
-
-
 @csrf_exempt
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def search_behavior(request, task_id):
@@ -1250,17 +1382,36 @@ def search_behavior(request, task_id):
         results = []
         search_pid = None
         search_tid = None
+        search_apicall = None
+        search_argname = None
+        search_procname = None
+
         match = re.search(r"pid=(?P<search_pid>\d+)", query)
         if match:
             search_pid = int(match.group("search_pid"))
         match = re.search(r"tid=(?P<search_tid>\d+)", query)
         if match:
             search_tid = match.group("search_tid")
+        match = re.search(r"apicall=(?P<search_apicall>[A-Za-z]+)", query)
+        if match:
+            search_apicall = match.group("search_apicall")
+        match = re.search(r"argname=(?P<search_argname>[A-Za-z]+)", query)
+        if match:
+            search_argname = match.group("search_argname")
+        match = re.search(r"procname=(?P<search_procname>[A-Za-z0-9\.\-]+)", query)
+        if match:
+            search_procname = match.group("search_procname")
 
         if search_pid:
             query = query.replace("pid=" + str(search_pid), "")
         if search_tid:
             query = query.replace("tid=" + search_tid, "")
+        if search_apicall:
+            query = query.replace("apicall=" + search_apicall, "")
+        if search_argname:
+            query = query.replace("argname=" + search_argname, "")
+        if search_procname:
+            query = query.replace("procname=" + search_procname, "")
 
         query = query.strip()
 
@@ -1276,6 +1427,8 @@ def search_behavior(request, task_id):
 
         # Loop through every process
         for process in record["behavior"]["processes"]:
+            if search_procname and process["process_name"].lower() != search_procname.lower():
+                continue
             if search_pid and process["process_id"] != search_pid:
                 continue
 
@@ -1295,15 +1448,17 @@ def search_behavior(request, task_id):
                 for call in chunk.get("calls", []):
                     if search_tid and call["thread_id"] != search_tid:
                         continue
-                    # TODO: ES can speed this up instead of parsing with
-                    # Python regex.
-                    if query.search(call["api"]):
-                        process_results.append(call)
-                    else:
-                        for argument in call["arguments"]:
-                            if query.search(argument["name"]) or query.search(argument["value"]):
-                                process_results.append(call)
-                                break
+                    if search_apicall and call["api"] != search_apicall:
+                        continue
+
+                    # TODO: ES can speed this up instead of parsing with Python regex.
+
+                    for argument in call["arguments"]:
+                        if search_argname and argument["name"] != search_argname:
+                            continue
+                        if query.search(argument["value"]):
+                            process_results.append(call)
+                            break
 
             if len(process_results) > 0:
                 results.append({"process": process, "signs": process_results})
@@ -1370,18 +1525,15 @@ def report(request, task_id):
         esdata = {"index": query["_index"], "id": query["_id"]}
         report["es"] = esdata
     if not report:
-        return render(request, "error.html", {"error": "The specified analysis does not exist or not finished yet"})
+        if DISABLED_WEB:
+            msg = "You need to enable Mongodb/ES to be able to use WEBGUI to see the analysis"
+        else:
+            msg = "The specified analysis does not exist or not finished yet."
+
+        return render(request, "error.html", {"error": msg})
 
     if isinstance(report.get("CAPE"), dict) and report.get("CAPE", {}).get("configs", {}):
         report["malware_conf"] = report["CAPE"]["configs"]
-    if enabledconf["compressresults"]:
-        for keyword in ("CAPE", "procdump", "enhanced", "summary"):
-            if report.get(keyword, False):
-                with suppress(Exception):
-                    report[keyword] = json.loads(zlib.decompress(report[keyword]))
-        if report.get("behavior", {}).get("summary", {}):
-            with suppress(Exception):
-                report["behavior"]["summary"] = json.loads(zlib.decompress(report["behavior"]["summary"]))
     report["CAPE"] = 0
     report["dropped"] = 0
     report["procdump"] = 0
@@ -1395,7 +1547,16 @@ def report(request, task_id):
                         "analysis",
                         [
                             {"$match": {"info.id": int(task_id)}},
-                            {"$project": {"_id": 0, f"{value}_size": {"$size": {"$ifNull": [f"${key}.sha256", []]}}}},
+                            {
+                                "$project": {
+                                    "_id": 0,
+                                    f"{value}_size": {
+                                        "$add": [
+                                            {"$size": {"$ifNull": [f"${key}.{subkey}", []]}} for subkey in ("sha256", "file_ref")
+                                        ]
+                                    },
+                                },
+                            },
                         ],
                     )
                 )[0][f"{value}_size"]
@@ -1456,13 +1617,13 @@ def report(request, task_id):
     vba2graph = False
     vba2graph_dict_content = {}
     # we don't want to do this for urls but we might as well check that the target exists
-    if report.get("target", {}).get("file", {}):
+    if report.get("target", {}).get("file", {}).get("sha256"):
         vba2graph = processing_cfg.vba2graph.enabled
         vba2graph_svg_path = os.path.join(
             CUCKOO_ROOT, "storage", "analyses", str(task_id), "vba2graph", "svg", report["target"]["file"]["sha256"] + ".svg"
         )
 
-        if path_exists(vba2graph_svg_path) and path_safe(vba2graph_svg_path):
+        if path_exists(vba2graph_svg_path) and _path_safe(vba2graph_svg_path):
             vba2graph_dict_content.setdefault(report["target"]["file"]["sha256"], Path(vba2graph_svg_path).read_text())
 
     bingraph = reporting_cfg.bingraph.enabled
@@ -1591,7 +1752,7 @@ def file_nl(request, category, task_id, dlfile):
     else:
         return render(request, "error.html", {"error": "Category not defined"})
 
-    if path and not path_safe(path):
+    if path and not _path_safe(path):
         return render(request, "error.html", {"error": "File not found"})
 
     # Performance considerations
@@ -1618,12 +1779,52 @@ zip_categories = (
     "droppedzipall",
     "procdumpzipall",
     "CAPEzipall",
+    "capeyarazipall",
+    "logszipall",
 )
 category_map = {
     "CAPE": "CAPE",
     "procdump": "procdump",
     "dropped": "files",
 }
+
+
+def _file_search_all_files(search_category: str, search_term: str) -> list:
+    path = []
+    try:
+        projection = {
+            "info.parent_sample.path": 1,
+            "info.parent_sample.cape_yara.name": 1,
+            "target.file.path": 1,
+            "target.file.cape_yara.name": 1,
+            "dropped.path": 1,
+            "dropped.cape_yara.name": 1,
+            "procdump.path": 1,
+            "procdump.cape_yara.name": 1,
+            "CAPE.payloads.path": 1,
+            "CAPE.payloads.cape_yara.name": 1,
+            "info.parent_sample.extracted_files_tool.path": 1,
+            "info.parent_sample.extracted_files_tool.cape_yara.name": 1,
+            "target.file.extracted_files_tool.path": 1,
+            "target.file.extracted_files_tool.cape_yara.name": 1,
+            "dropped.extracted_files_tool.path": 1,
+            "dropped.extracted_files_tool.cape_yara.name": 1,
+            "procdump.extracted_files_tool.path": 1,
+            "procdump.extracted_files_tool.cape_yara.name": 1,
+            "CAPE.payloads.extracted_files_tool.path": 1,
+            "CAPE.payloads.extracted_files_tool.cape_yara.name": 1,
+        }
+        records = perform_search(search_category, search_term, projection=projection)
+        search_term = search_term.lower()
+        for _, filepath, _, _ in yara_detected(search_term, records):
+            if not path_exists(filepath):
+                continue
+            path.append(filepath)
+    except ValueError as e:
+        print("mongodb load", e)
+
+    # remove any duplicated before return
+    return list(set(path))
 
 
 @require_safe
@@ -1643,7 +1844,7 @@ def file(request, category, task_id, dlfile):
     }
 
     if category in zip_categories and not HAVE_PYZIPPER:
-        return render(request, "error.html", {"error": "Missed pyzipper library"})
+        return render(request, "error.html", {"error": "Missed pyzipper library: poetry install"})
 
     if category in ("sample", "static", "staticzip"):
         path = os.path.join(CUCKOO_ROOT, "storage", "binaries", file_name)
@@ -1677,6 +1878,10 @@ def file(request, category, task_id, dlfile):
     elif category in ("pcap", "pcapzip"):
         file_name += ".pcap"
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "dump.pcap")
+        cd = "application/vnd.tcpdump.pcap"
+    elif category == "pcapng":
+        file_name += ".pcapng"
+        path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "dump.pcapng")
         cd = "application/vnd.tcpdump.pcap"
     elif category == "debugger_log":
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "debugger", str(dlfile) + ".log")
@@ -1718,10 +1923,22 @@ def file(request, category, task_id, dlfile):
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "rtf_objects", file_name)
     elif category == "tlskeys":
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "tlsdump", "tlsdump.log")
+    # linux sysmon url to download sysmon.data xml
+    elif category == "sysmon":
+        path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "sysmon", "sysmon.data")
     elif category == "evtx":
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "evtx", "evtx.zip")
         file_name = f"{task_id}_evtx.zip"
         cd = "application/zip"
+    elif category == "capeyarazipall":
+        # search in mongo and get the path
+        if enabledconf["mongodb"] and web_cfg.zipped_download.download_all:
+            path = _file_search_all_files(category.replace("zipall", ""), dlfile)
+    elif category == "logszipall":
+        buf = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "logs")
+        path = []
+        for dfile in os.listdir(buf):
+            path.append(os.path.join(buf, dfile))
     else:
         return render(request, "error.html", {"error": "Category not defined"})
 
@@ -1743,25 +1960,41 @@ def file(request, category, task_id, dlfile):
     if isinstance(path, list):
         test_path = path[0]
 
-    if test_path and (not path_exists(test_path) or not path_safe(test_path)):
+    if test_path and (not path_exists(test_path) or not _path_safe(test_path)):
         return render(request, "error.html", {"error": "File {} not found".format(os.path.basename(test_path))})
 
     try:
         if category in zip_categories:
-            mem_zip = BytesIO()
-            with pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
-                zf.setpassword(settings.ZIP_PWD)
-                if not isinstance(path, list):
-                    path = [path]
-                for file in path:
-                    with open(file, "rb") as f:
-                        zf.writestr(os.path.basename(file), f.read())
-            mem_zip.seek(0)
-            resp = StreamingHttpResponse(mem_zip, content_type=cd)
-            resp["Content-Length"] = len(mem_zip.getvalue())
-            file_name += ".zip"
-            path = os.path.join(tempfile.gettempdir(), file_name)
-            cd = "application/zip"
+            if not isinstance(path, list):
+                path = [path]
+            if USE_SEVENZIP:
+                zip_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", f"{task_id}", f"{file_name}.zip")
+                sevenZipArgs = [SEVENZIP_PATH, f"-p{settings.ZIP_PWD.decode()}", "a", zip_path]
+                sevenZipArgs.extend(path)
+                try:
+                    subprocess.check_call(sevenZipArgs)
+                except subprocess.CalledProcessError:
+                    return render(request, "error.html", {"error": "error compressing file"})
+                zip_fd = open(zip_path, "rb")
+                resp = StreamingHttpResponse(zip_fd, content_type="application/zip")
+                resp["Content-Length"] = os.path.getsize(zip_path)
+                resp["Content-Disposition"] = f"attachment; filename={file_name}.zip"
+                return resp
+            else:
+                mem_zip = BytesIO()
+                with pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
+                    zf.setpassword(settings.ZIP_PWD)
+                    if not isinstance(path, list):
+                        path = [path]
+                    for file in path:
+                        with open(file, "rb") as f:
+                            zf.writestr(os.path.basename(file), f.read())
+                mem_zip.seek(0)
+                resp = StreamingHttpResponse(mem_zip, content_type=cd)
+                resp["Content-Length"] = len(mem_zip.getvalue())
+                file_name += ".zip"
+                path = os.path.join(tempfile.gettempdir(), file_name)
+                cd = "application/zip"
         else:
             resp = StreamingHttpResponse(FileWrapper(open(path, "rb"), 8091), content_type=cd)
             resp["Content-Length"] = Path(path).stat().st_size
@@ -1786,7 +2019,7 @@ def procdump(request, task_id, process_id, start, end, zipped=False):
 
     dumpfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "memory", origname)
 
-    if not path_safe(dumpfile):
+    if not _path_safe(dumpfile):
         return render(request, "error.html", {"error": f"File not found: {os.path.basename(dumpfile)}"})
 
     if not path_exists(dumpfile):
@@ -1876,7 +2109,7 @@ def filereport(request, task_id, category):
     if category in formats:
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "reports", formats[category])
 
-        if not path_safe(path) or not path_exists(path):
+        if not _path_safe(path) or not path_exists(path):
             return render(request, "error.html", {"error": f"File not found: {formats[category]}"})
 
         response = HttpResponse(Path(path).read_bytes(), content_type="application/octet-stream")
@@ -1892,7 +2125,7 @@ def full_memory_dump_file(request, analysis_number):
     filename = False
     for name in ("memory.dmp", "memory.dmp.zip"):
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(analysis_number), name)
-        if path_exists(path) and path_safe(path):
+        if path_exists(path) and _path_safe(path):
             filename = name
             break
 
@@ -1914,7 +2147,7 @@ def full_memory_dump_strings(request, analysis_number):
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(analysis_number), name)
         if path_exists(path):
             filename = name
-            if not path_safe(ANALYSIS_BASE_PATH):
+            if not _path_safe(ANALYSIS_BASE_PATH):
                 return render(request, "error.html", {"error": f"File not found: {name}"})
             break
     if filename:
@@ -1932,10 +2165,13 @@ def full_memory_dump_strings(request, analysis_number):
 @ratelimit(key="ip", rate=my_rate_seconds, block=rateblock)
 @ratelimit(key="ip", rate=my_rate_minutes, block=rateblock)
 def search(request, searched=""):
-    if "search" in request.POST or searched:
+    if "search" in request.POST or "search" in request.GET or searched:
         term = ""
-        if not searched and request.POST.get("search"):
-            searched = str(request.POST["search"])
+        if not searched:
+            if request.POST.get("search"):
+                searched = str(request.POST["search"])
+            elif request.GET.get("search"):
+                searched = str(request.GET["search"])
 
         if ":" in searched:
             term, value = searched.strip().split(":", 1)
@@ -1981,6 +2217,8 @@ def search(request, searched=""):
         if isinstance(value, str):
             value = value.replace("\\", "\\\\")
 
+        term_only, value_only = term, value
+
         try:
             records = perform_search(term, value, user_id=request.user.id, privs=request.user.is_staff)
         except ValueError:
@@ -2009,10 +2247,18 @@ def search(request, searched=""):
             if not new:
                 continue
             analyses.append(new)
+
         return render(
             request,
             "analysis/search.html",
-            {"analyses": analyses, "config": enabledconf, "term": searched, "error": None},
+            {
+                "analyses": analyses,
+                "config": enabledconf,
+                "term": searched,
+                "error": None,
+                "term_only": term_only,
+                "value_only": value_only,
+            },
         )
     return render(request, "analysis/search.html", {"analyses": None, "term": None, "error": None})
 
@@ -2114,7 +2360,7 @@ def pcapstream(request, task_id, conntuple):
         # if we do, build out the path to it
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "dump_sorted.pcap")
 
-        if not path_exists(path) or not path_safe(path):
+        if not path_exists(path) or not _path_safe(path):
             return render(request, "standalone_error.html", {"error": "The required sorted PCAP does not exist"})
 
         fobj = open(path, "rb")
@@ -2184,7 +2430,7 @@ def vtupload(request, category, task_id, filename, dlfile):
             if folder_name:
                 path = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, folder_name, filename)
 
-            if not path or not path_safe(path):
+            if not path or not _path_safe(path):
                 return render(request, "error.html", {"error": f"File not found: {os.path.basename(path)}"})
 
             headers = {"x-apikey": settings.VTDL_KEY}
@@ -2277,7 +2523,7 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
         category = "target.file"
         extractedfile = True
 
-    if path and (not path_safe(path) or not path_exists(path)):
+    if path and (not _path_safe(path) or not path_exists(path)):
         return render(request, "error.html", {"error": "File not found: {}".format(path)})
 
     details = False
@@ -2379,3 +2625,15 @@ def ban_user(request, user_id: int):
         else:
             return render(request, "error.html", {"error": f"Can't ban user id {user_id}"})
     return render(request, "error.html", {"error": "Nice try! You don't have permission to ban users"})
+
+
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+def reprocess_task(request, task_id: int):
+    if not settings.REPROCESS_TASKS:
+        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+
+    error, msg, _ = db.tasks_reprocess(task_id)
+    if error:
+        return render(request, "error.html", {"error": msg})
+    else:
+        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))

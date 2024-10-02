@@ -67,7 +67,7 @@ def flare_capa(proxy=None):
         print(e)
 
 
-def install(enabled, force, rewrite, filepath: str = False, access_token=None, proxy=False, url: str = False):
+def install(enabled, force, rewrite, clean=False, filepath: str = False, access_token=None, proxy=False, url: str = False):
     if filepath and path_exists(filepath):
         t = tarfile.TarFile.open(filepath, mode="r:gz")
     else:
@@ -106,6 +106,7 @@ def install(enabled, force, rewrite, filepath: str = False, access_token=None, p
         "integrations": "lib/cuckoo/common/integrations",
         "mitre": "data/mitre",
         "yara": "data/yara",
+        "utils": "utils",
     }
 
     members = t.getmembers()
@@ -117,6 +118,10 @@ def install(enabled, force, rewrite, filepath: str = False, access_token=None, p
             continue
 
         print(f"\nInstalling {colors.cyan(category.upper())}")
+
+        if clean and path_exists(folder):
+            print(f"\n Deleting the folder content of the category {colors.cyan(category.upper())}")
+            shutil.rmtree(folder)
 
         # E.g., "community-master/modules/signatures".
         name_start = f"{directory}/{folder}"
@@ -159,14 +164,33 @@ def install(enabled, force, rewrite, filepath: str = False, access_token=None, p
                 if not path_exists(os.path.dirname(filepath)):
                     path_mkdir(os.path.dirname(filepath))
 
-                print(f'File "{filepath}" {colors.green("installed")}')
-                open(filepath, "wb").write(t.extractfile(member).read())
+                try:
+                    with open(filepath, "wb") as f:
+                        f.write(t.extractfile(member).read())
+                    print(f'File "{filepath}" {colors.green("installed")}')
+                except PermissionError:
+                    print(colors.red(f"Fix permission on: {filepath}"))
+
+
+def ipinfo_asn_database_fetch(token, proxy=False):
+    if proxy:
+        http = urllib3.ProxyManager(proxy)
+    else:
+        http = urllib3.PoolManager()
+    try:
+        database = http.request("GET", "https://ipinfo.io/data/free/country_asn.mmdb", fields={"token": token}).data
+        if database:
+            with open(os.path.join(CUCKOO_ROOT, "data", "country_asn.mmdb"), "wb") as f:
+                f.write(database)
+
+    except Exception as e:
+        log.error("Can't getch asn database: %s", str(e))
 
 
 def main():
-
     parser = argparse.ArgumentParser()
     parser.add_argument("-a", "--all", help="Download everything", action="store_true", required=False)
+    parser.add_argument("-c", "--clean", help="Clean existing files", action="store_true", required=False)
     parser.add_argument("-cm", "--common", help="Download CAPE common modules", action="store_true", required=False)
     parser.add_argument("-e", "--feeds", help="Download CAPE feed modules", action="store_true", required=False)
     parser.add_argument("-s", "--signatures", help="Download CAPE signatures", action="store_true", required=False)
@@ -203,6 +227,16 @@ def main():
     )
     parser.add_argument("--proxy", help="Proxy to use. Ex http://127.0.0.1:8080", action="store", required=False)
     parser.add_argument("-y", "--yara", help="Download YARA rules", action="store_true", required=False)
+    parser.add_argument("-ut", "--utils", help="Download community utilities", action="store_true", required=False)
+
+    parser.add_argument(
+        "-iasn",
+        "--ipinfo-asn",
+        help="Download ipinfo.io ASN database. provide your token as argument",
+        action="store",
+        required=False,
+    )
+
     args = parser.parse_args()
 
     enabled = []
@@ -219,8 +253,9 @@ def main():
             "integrations",
             "mitre",
             "common",
+            "utils",
         ]
-        flare_capa()
+        flare_capa(args.proxy)
     else:
         if args.feeds:
             enabled.append("feeds")
@@ -245,6 +280,8 @@ def main():
             enabled.append("integrations")
         if args.mitre_offline:
             enabled.append("mitre")
+        if args.utils:
+            enabled.append("utils")
 
     if args.capa_rules:
         flare_capa(args.proxy)
@@ -253,6 +290,11 @@ def main():
 
     if args.mitre:
         mitre_update()
+        if not enabled:
+            return
+
+    if args.ipinfo_asn:
+        ipinfo_asn_database_fetch(args.ipinfo_asn, args.proxy)
         if not enabled:
             return
 
@@ -265,6 +307,7 @@ def main():
         enabled,
         args.force,
         args.rewrite,
+        args.clean,
         args.file,
         args.token,
         args.proxy,

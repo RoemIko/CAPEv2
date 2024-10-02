@@ -4,10 +4,12 @@
 
 import os
 import tempfile
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import lib.cuckoo.common.abstracts as abstracts
+from lib.cuckoo.common.exceptions import CuckooCriticalError
 from lib.cuckoo.common.path_utils import path_exists
 
 
@@ -62,3 +64,65 @@ class TestReport:
     def test_not_implemented_run(self, rep):
         with pytest.raises(NotImplementedError):
             rep.run()
+
+
+@pytest.mark.usefixtures("db")
+class TestScreenshotMachinery:
+    def test_missing_screenshot_method(self):
+        class MockMachinery(abstracts.Machinery):
+            module_name = "mock"
+
+            def read_config(self):
+                return {"mock": {"machines": []}}
+
+            def _list(self):
+                pass
+
+        tm = MockMachinery()
+        mock_cuckoo_cfg = MagicMock()
+        mock_cuckoo_cfg.machinery_screenshots = True
+
+        with patch.object(abstracts.cfg, "cuckoo", mock_cuckoo_cfg):
+            # calling _initialize_check() raises without any methods
+            with pytest.raises(CuckooCriticalError):
+                tm._initialize_check()
+
+    def test_machinery_missing_screenshot_support(self):
+        class MockMachinery(abstracts.Machinery):
+            module_name = "mock"
+
+            def read_config(self):
+                return {"mock": {"machines": []}}
+
+            def _list(self):
+                pass
+
+        tm = MockMachinery()
+        mock_cuckoo_cfg = MagicMock()
+        mock_cuckoo_cfg.machinery_screenshots = True
+
+        with patch.object(abstracts.cfg, "cuckoo", mock_cuckoo_cfg):
+            # calling _initialize_check() raises without providing a screenshot() impl
+            with pytest.raises(CuckooCriticalError):
+                tm._initialize_check()
+
+    def test_machinery_screenshot_support(self):
+        class MockMachinery(abstracts.Machinery):
+            module_name = "mock"
+
+            def read_config(self):
+                return {"mock": {"machines": []}}
+
+            def _list(self):
+                pass
+
+            def screenshot(self):
+                return True
+
+        tm = MockMachinery()
+        mock_cuckoo_cfg = MagicMock()
+        mock_cuckoo_cfg.machinery_screenshots = True
+        with patch.object(abstracts.cfg, "cuckoo", mock_cuckoo_cfg):
+            # calling _initialize_check() succeeds, a screenshot() impl is provided
+            tm._initialize_check()
+        assert tm.screenshot()

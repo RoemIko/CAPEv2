@@ -8,6 +8,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+from contextlib import suppress
 from typing import DefaultDict, List, Optional, Set, Union
 
 import pebble
@@ -25,8 +26,6 @@ from lib.cuckoo.common.integrations.parse_dotnet import DotNETExecutable
 from lib.cuckoo.common.integrations.parse_java import Java
 from lib.cuckoo.common.integrations.parse_lnk import LnkShortcut
 from lib.cuckoo.common.integrations.parse_office import HAVE_OLETOOLS, Office
-
-# ToDo duplicates logging here
 from lib.cuckoo.common.integrations.parse_pdf import PDF
 from lib.cuckoo.common.integrations.parse_pe import HAVE_PEFILE, PortableExecutable
 from lib.cuckoo.common.integrations.parse_wsf import WindowsScriptFile  # EncodedScriptFile
@@ -34,7 +33,15 @@ from lib.cuckoo.common.integrations.parse_wsf import WindowsScriptFile  # Encode
 # from lib.cuckoo.common.integrations.parse_elf import ELF
 from lib.cuckoo.common.load_extra_modules import file_extra_info_load_modules
 from lib.cuckoo.common.objects import File
-from lib.cuckoo.common.path_utils import path_exists, path_get_size, path_is_file, path_mkdir, path_read_file, path_write_file
+from lib.cuckoo.common.path_utils import (
+    path_delete,
+    path_exists,
+    path_get_size,
+    path_is_file,
+    path_mkdir,
+    path_read_file,
+    path_write_file,
+)
 from lib.cuckoo.common.utils import get_options, is_text_file
 
 try:
@@ -53,7 +60,7 @@ except ImportError:
 
 DuplicatesType = DefaultDict[str, Set[str]]
 
-
+cfg = Config()
 processing_conf = Config("processing")
 selfextract_conf = Config("selfextract")
 
@@ -61,6 +68,12 @@ try:
     from modules.signatures.recon_checkip import dns_indicators
 except ImportError:
     dns_indicators = ()
+
+HAVE_DIE = False
+with suppress(ImportError):
+    import die
+
+    HAVE_DIE = True
 
 
 HAVE_FLARE_CAPA = False
@@ -97,7 +110,7 @@ try:
     HAVE_BAT_DECODER = True
 except ImportError:
     HAVE_BAT_DECODER = False
-    print("OPTIONAL! Missed dependency: pip3 install -U git+https://github.com/DissectMalware/batch_deobfuscator")
+    print("OPTIONAL! Missed dependency: poetry run pip install -U git+https://github.com/DissectMalware/batch_deobfuscator")
 
 processing_conf = Config("processing")
 selfextract_conf = Config("selfextract")
@@ -127,6 +140,7 @@ if processing_conf.virustotal.enabled and not processing_conf.virustotal.on_dema
 
 exclude_startswith = ("parti_",)
 excluded_extensions = (".parti",)
+tools_folder = os.path.join(cfg.cuckoo.get("tmppath", "/tmp"), "cape-external")
 
 
 def static_file_info(
@@ -144,14 +158,16 @@ def static_file_info(
         log.info("static_file_info: skipping file that exceeded max_file_size: %s: %d MB", file_path, size_mb)
         return
 
+    options_dict = get_options(options)
+    if options_dict.get("static_file_info", "") == "off":
+        return
+
     if (
         not HAVE_OLETOOLS
         and "Zip archive data, at least v2.0" in data_dictionary["type"]
         and package in {"doc", "ppt", "xls", "pub"}
     ):
         log.info("Missed dependencies: pip3 install oletools")
-
-    options_dict = get_options(options)
 
     if HAVE_PEFILE and ("PE32" in data_dictionary["type"] or "MS-DOS executable" in data_dictionary["type"]):
         data_dictionary["pe"] = PortableExecutable(file_path).run(task_id)
@@ -210,7 +226,7 @@ def static_file_info(
         if processing_conf.trid.enabled:
             data_dictionary["trid"] = trid_info(file_path)
 
-        if processing_conf.die.enabled:
+        if processing_conf.die.enabled and HAVE_DIE:
             data_dictionary["die"] = detect_it_easy_info(file_path)
 
         if HAVE_FLOSS and processing_conf.floss.enabled:
@@ -218,10 +234,18 @@ def static_file_info(
             if floss_strings:
                 data_dictionary["floss"] = floss_strings
 
-        if HAVE_STRINGS:
+        if data_dictionary["data"]:
+            # Don't store "strings" for text files, but don't let the web frontend
+            # think that we want to look them up on-demand (i.e. display the
+            # "strings" button linking to an on_demand URL).
+            data_dictionary["strings"] = []
+        elif HAVE_STRINGS:
             strings = extract_strings(file_path, dedup=True)
-            if strings:
-                data_dictionary["strings"] = strings
+            data_dictionary["strings"] = strings
+        else:
+            # Don't store anything in data_dictionary["strings"] so that the frontend
+            # will display the "strings" button and allow them to be fetched on-demand.
+            pass
 
         # ToDo we need url support
         if HAVE_VIRUSTOTAL and processing_conf.virustotal.enabled:
@@ -240,24 +264,28 @@ def static_file_info(
 
 
 def detect_it_easy_info(file_path: str):
-    if not path_exists(processing_conf.die.binary):
-        return []
-
     try:
-        output = subprocess.check_output(
-            [processing_conf.die.binary, "-j", file_path],
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-        )
-        if "detects" not in output:
+        try:
+            result_json = die.scan_file(file_path, die.ScanFlags.RESULT_AS_JSON, str(die.database_path / "db"))
+        except Exception as e:
+            log.error("DIE error: %s", str(e))
+
+        if "detects" not in result_json:
             return []
 
-        strings = [sub["string"] for block in json.loads(output).get("detects", []) for sub in block.get("values", [])]
+        if "Invalid signature" in result_json and "{" in result_json:
+            start = result_json.find("{")
+            if start != -1:
+                result_json = result_json[start:]
+
+        strings = [sub["string"] for block in json.loads(result_json).get("detects", []) for sub in block.get("values", [])]
 
         if strings:
             return strings
+    except json.decoder.JSONDecodeError as e:
+        log.debug("DIE results are not in json format: %s", str(e))
     except Exception as e:
-        log.error("Trid error: %s", str(e))
+        log.error("DIE error: %s", str(e))
     return []
 
 
@@ -274,6 +302,10 @@ def trid_info(file_path: dict):
             "You need to configure your server to make TrID work properly. Run trid by hand on file as example to ensure that it works properly."
         )
         log.warning("sudo rm -f /usr/lib/locale/locale-archive && sudo locale-gen --no-archive")
+    except PermissionError:
+        log.error(
+            "You have permission error. FIX IT! sudo chown cape:cape /opt/CAPEv2/data/trid -R && sudo chmod a+x /opt/CAPEv2/data/trid/trid"
+        )
     except Exception as e:
         log.error("Trid error: %s", str(e))
 
@@ -282,7 +314,6 @@ def _extracted_files_metadata(
     folder: str,
     destination_folder: str,
     files: List[str],
-    duplicated: Optional[DuplicatesType] = None,
     results: Optional[dict] = None,
 ) -> List[dict]:
     """
@@ -306,11 +337,6 @@ def _extracted_files_metadata(
                 continue
 
             file = File(full_path)
-            sha256 = file.get_sha256()
-            if sha256 in duplicated["sha256"]:
-                continue
-
-            duplicated["sha256"].add(sha256)
             file_info, pefile_object = file.get_all()
             if pefile_object:
                 results.setdefault("pefiles", {}).setdefault(file_info["sha256"], pefile_object)
@@ -318,7 +344,7 @@ def _extracted_files_metadata(
             if processing_conf.trid.enabled:
                 file_info["trid"] = trid_info(full_path)
 
-            if processing_conf.die.enabled:
+            if processing_conf.die.enabled and HAVE_DIE:
                 file_info["die"] = detect_it_easy_info(full_path)
 
             dest_path = os.path.join(destination_folder, file_info["sha256"])
@@ -418,6 +444,14 @@ def generic_file_extractors(
 
     futures = {}
     with pebble.ProcessPool(max_workers=int(selfextract_conf.general.max_workers)) as pool:
+        # Prefer custom modules over the built-in ones, since only 1 is allowed
+        # to be the extracted_files_tool.
+        if extra_info_modules:
+            for module in extra_info_modules:
+                func_timeout = int(getattr(module, "timeout", 60))
+                funcname = module.__name__.split(".")[-1]
+                futures[funcname] = pool.schedule(module.extract_details, args=args, kwargs=kwargs, timeout=func_timeout)
+
         for extraction_func in file_info_funcs:
             funcname = extraction_func.__name__.split(".")[-1]
             if (
@@ -428,12 +462,6 @@ def generic_file_extractors(
 
             func_timeout = int(getattr(selfextract_conf, funcname, {}).get("timeout", 60))
             futures[funcname] = pool.schedule(extraction_func, args=args, kwargs=kwargs, timeout=func_timeout)
-
-        if extra_info_modules:
-            for module in extra_info_modules:
-                func_timeout = int(getattr(module, "timeout", 60))
-                funcname = module.__name__.split(".")[-1]
-                futures[funcname] = pool.schedule(module.extract_details, args=args, kwargs=kwargs, timeout=func_timeout)
     pool.join()
 
     for funcname, future in futures.items():
@@ -444,6 +472,8 @@ def generic_file_extractors(
             timeout = err.args[0]
             log.debug("Function: %s took longer than %d seconds", funcname, timeout)
             continue
+        except TypeError as err:
+            log.debug("TypeError on getting results: %s", str(err))
         except Exception as err:
             log.exception("file_extra_info: %s", err)
             continue
@@ -469,11 +499,9 @@ def generic_file_extractors(
             old_tool_name = data_dictionary.get("extracted_files_tool")
             new_tool_name = extraction_result["tool_name"]
             if old_tool_name:
-                log.warning("Files already extracted from %s by %s. Also extracted with %s", file, old_tool_name, new_tool_name)
+                log.debug("Files already extracted from %s by %s. Also extracted with %s", file, old_tool_name, new_tool_name)
                 continue
-            metadata = _extracted_files_metadata(
-                tempdir, destination_folder, files=extracted_files, duplicated=duplicated, results=results
-            )
+            metadata = _extracted_files_metadata(tempdir, destination_folder, files=extracted_files, results=results)
             data_dictionary.update(
                 {
                     "extracted_files": metadata,
@@ -483,11 +511,12 @@ def generic_file_extractors(
             )
         finally:
             if tempdir:
+                # ToDo doesn't work
                 shutil.rmtree(tempdir, ignore_errors=True)
 
 
 def _generic_post_extraction_process(file: str, tool_name: str, decoded: str) -> SuccessfulExtractionReturnType:
-    with extractor_ctx(file, tool_name) as ctx:
+    with extractor_ctx(file, tool_name, folder=tools_folder) as ctx:
         basename = f"{os.path.basename(file)}_decoded"
         decoded_file_path = os.path.join(ctx["tempdir"], basename)
         _ = path_write_file(decoded_file_path, decoded, mode="text")
@@ -567,7 +596,7 @@ def eziriz_deobfuscate(file: str, *, data_dictionary: dict, **_) -> ExtractorRet
         log.error("You need to add execution permissions: chmod a+x data/NETReactorSlayer.CLI")
         return
 
-    with extractor_ctx(file, "eziriz", prefix="eziriz_") as ctx:
+    with extractor_ctx(file, "eziriz", prefix="eziriz_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         dest_path = os.path.join(tempdir, os.path.basename(file))
         _ = run_tool(
@@ -600,7 +629,7 @@ def de4dot_deobfuscate(file: str, *, filetype: str, **_) -> ExtractorReturnType:
         log.error("Missed dependency: sudo apt install de4dot")
         return
 
-    with extractor_ctx(file, "de4dot", prefix="de4dot_") as ctx:
+    with extractor_ctx(file, "de4dot", prefix="de4dot_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         dest_path = os.path.join(tempdir, os.path.basename(file))
         _ = run_tool(
@@ -629,7 +658,7 @@ def msi_extract(file: str, *, filetype: str, **kwargs) -> ExtractorReturnType:
 
     extracted_files = []
     # sudo apt install msitools or 7z
-    with extractor_ctx(file, "MsiExtract", prefix="msidump_") as ctx:
+    with extractor_ctx(file, "MsiExtract", prefix="msidump_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         output = False
         if not kwargs.get("tests"):
@@ -647,20 +676,18 @@ def msi_extract(file: str, *, filetype: str, **kwargs) -> ExtractorReturnType:
             ]
         else:
             output = run_tool(
-                [
-                    "7z",
-                    "e",
-                    f"-o{tempdir}",
-                    "-y",
-                    file,
-                    "Binary.*",
-                ],
+                ["7z", "e", f"-o{tempdir}", "-y", file],
                 universal_newlines=True,
                 stderr=subprocess.PIPE,
             )
+            valid_msi_filetypes = ["PE32", "text", "Microsoft Cabinet archive"]
             for root, _, filenames in os.walk(tempdir):
                 for filename in filenames:
-                    os.rename(os.path.join(root, filename), os.path.join(root, filename.split("Binary.")[-1]))
+                    path = os.path.join(root, filename)
+                    if any([x in File(path).get_type() for x in valid_msi_filetypes]):
+                        os.rename(path, os.path.join(root, filename.split(".")[-1].strip("'").strip("!")))
+                    else:
+                        path_delete(path)
             extracted_files = collect_extracted_filenames(tempdir)
 
         ctx["extracted_files"] = extracted_files
@@ -679,7 +706,7 @@ def Inno_extract(file: str, *, data_dictionary: dict, **_) -> ExtractorReturnTyp
         log.error("Missed dependency: sudo apt install innoextract")
         return
 
-    with extractor_ctx(file, "InnoExtract", prefix="innoextract_") as ctx:
+    with extractor_ctx(file, "InnoExtract", prefix="innoextract_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         run_tool(
             [selfextract_conf.Inno_extract.binary, file, "--output-dir", tempdir],
@@ -705,7 +732,7 @@ def kixtart_extract(file: str, **_) -> ExtractorReturnType:
     if not data.startswith(b"\x1a\xaf\x06\x00\x00\x10"):
         return
 
-    with extractor_ctx(file, "Kixtart", prefix="kixtart_") as ctx:
+    with extractor_ctx(file, "Kixtart", prefix="kixtart_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         kix = Kixtart(file, dump_dir=tempdir)
         kix.decrypt()
@@ -715,16 +742,22 @@ def kixtart_extract(file: str, **_) -> ExtractorReturnType:
     return ctx
 
 
+UN_AUTOIT_NOTIF = False
+
+
 @time_tracker
 def UnAutoIt_extract(file: str, *, data_dictionary: dict, **_) -> ExtractorReturnType:
-    if all(block.get("name") != "AutoIT_Compiled" for block in data_dictionary.get("yara", {})):
+    global UN_AUTOIT_NOTIF
+    if all(block.get("name") not in ("AutoIT_Compiled", "AutoIT_Script") for block in data_dictionary.get("yara", {})):
         return
 
-    if not path_exists(unautoit_binary):
-        log.warning(f"Missing UnAutoIt binary: {unautoit_binary}. Download from - https://github.com/x0r19x91/UnAutoIt")
+    # this is useless to notify in each iteration
+    if not UN_AUTOIT_NOTIF and not path_exists(unautoit_binary):
+        # log.warning(f"Missing UnAutoIt binary: {unautoit_binary}. Download from - https://github.com/x0r19x91/UnAutoIt")
+        UN_AUTOIT_NOTIF = True
         return
 
-    with extractor_ctx(file, "UnAutoIt", prefix="unautoit_") as ctx:
+    with extractor_ctx(file, "UnAutoIt", prefix="unautoit_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         output = run_tool(
             [unautoit_binary, "extract-all", "--output-dir", tempdir, file],
@@ -746,7 +779,7 @@ def UPX_unpack(file: str, *, filetype: str, data_dictionary: dict, **_) -> Extra
     ):
         return
 
-    with extractor_ctx(file, "UnUPX", prefix="unupx_") as ctx:
+    with extractor_ctx(file, "UnUPX", prefix="unupx_", folder=tools_folder) as ctx:
         basename = f"{os.path.basename(file)}_unpacked"
         dest_path = os.path.join(ctx["tempdir"], basename)
         output = run_tool(
@@ -775,9 +808,14 @@ def SevenZip_unpack(file: str, *, filetype: str, data_dictionary: dict, options:
         return
 
     # Check for msix file since it's a zip
+    file_data = File(file).file_data
+    if not file_data:
+        log.debug("sevenzip: No file data")
+        return
+
     if (
         ".msix" in data_dictionary.get("name", "")
-        or all([pattern in File(file).file_data for pattern in (b"Registry.dat", b"AppxManifest.xml")])
+        or all([pattern in file_data for pattern in (b"Registry.dat", b"AppxManifest.xml")])
         or any("MSIX Windows app" in string for string in data_dictionary.get("trid", []))
     ):
         return
@@ -815,7 +853,7 @@ def SevenZip_unpack(file: str, *, filetype: str, data_dictionary: dict, options:
     else:
         return
 
-    with extractor_ctx(file, tool, prefix=prefix) as ctx:
+    with extractor_ctx(file, tool, prefix=prefix, folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         HAVE_SFLOCK = False
         if HAVE_SFLOCK:
@@ -855,7 +893,7 @@ def RarSFX_extract(file, *, data_dictionary, options: dict, **_) -> ExtractorRet
         log.warning("Missed UnRar binary: /usr/bin/unrar. sudo apt install unrar")
         return
 
-    with extractor_ctx(file, "UnRarSFX", prefix="unrar_") as ctx:
+    with extractor_ctx(file, "UnRarSFX", prefix="unrar_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         password = options.get("password", "infected")
         output = run_tool(
@@ -877,7 +915,7 @@ def office_one(file, **_) -> ExtractorReturnType:
     ):
         return
 
-    with extractor_ctx(file, "OfficeOne", prefix="office_one") as ctx:
+    with extractor_ctx(file, "OfficeOne", prefix="office_one", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         try:
             document = OneNoteExtractor(path_read_file(file))
@@ -895,27 +933,18 @@ def office_one(file, **_) -> ExtractorReturnType:
 def msix_extract(file: str, *, data_dictionary: dict, **_) -> ExtractorReturnType:
     """Work on MSIX Package"""
 
-    if not all([pattern in File(file).file_data for pattern in (b"Registry.dat", b"AppxManifest.xml")]) or not any(
+    if not all([pattern in File(file).file_data for pattern in (b"Registry.dat", b"AppxManifest.xml")]) and not any(
         "MSIX Windows app" in string for string in data_dictionary.get("trid", [])
     ):
         return
 
-    with extractor_ctx(file, "MSIX", prefix="msixdump_") as ctx:
+    with extractor_ctx(file, "MSIX", prefix="msixdump_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
-        if HAVE_SFLOCK:
-            unpacked = unpack(file.encode())
-            for child in unpacked.children:
-                _ = path_write_file(os.path.join(tempdir, child.filename.decode()), child.contents)
-        else:
-            _ = run_tool(
-                [
-                    "unzip",
-                    file,
-                    f"-d {tempdir}",
-                ],
-                universal_newlines=True,
-                stderr=subprocess.PIPE,
-            )
+        _ = run_tool(
+            ["unzip", file, "-d", tempdir],
+            universal_newlines=True,
+            stderr=subprocess.PIPE,
+        )
         ctx["extracted_files"] = collect_extracted_filenames(tempdir)
 
     return ctx

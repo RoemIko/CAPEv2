@@ -1,9 +1,10 @@
 # encoding: utf-8
+import hashlib
 import json
 import logging
 import os
-import shutil
 import socket
+import subprocess
 import sys
 import zipfile
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ from urllib.parse import quote
 from wsgiref.util import FileWrapper
 
 import pyzipper
+import requests
 from bson.objectid import ObjectId
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
@@ -51,16 +53,7 @@ from lib.cuckoo.common.web_utils import (
     statistics,
     validate_task,
 )
-from lib.cuckoo.core.database import (
-    TASK_COMPLETED,
-    TASK_FAILED_PROCESSING,
-    TASK_FAILED_REPORTING,
-    TASK_RECOVERED,
-    TASK_REPORTED,
-    TASK_RUNNING,
-    Database,
-    Task,
-)
+from lib.cuckoo.core.database import TASK_RECOVERED, TASK_RUNNING, Database, Task, _Database
 from lib.cuckoo.core.rooter import _load_socks5_operational, vpns
 
 try:
@@ -89,12 +82,19 @@ except ImportError:
 repconf = Config("reporting")
 web_conf = Config("web")
 routing_conf = Config("routing")
+reporting_conf = Config("reporting")
 
 zlib_compresion = False
 if repconf.compression.enabled:
     from zlib import decompress
 
     zlib_compresion = True
+
+USE_SEVENZIP = False
+if reporting_conf.compression.compressiontool.strip() == "7zip":
+    USE_SEVENZIP = True
+    SEVENZIP_PATH = reporting_conf.compression.sevenzippath.strip() or "/usr/bin/7z"
+
 
 if repconf.mongodb.enabled:
     from dev_utils.mongodb import mongo_delete_data, mongo_find, mongo_find_one, mongo_find_one_and_update
@@ -106,7 +106,7 @@ if repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
     es_as_db = True
     es = elastic_handler
 
-db = Database()
+db: _Database = Database()
 
 
 # Conditional decorator for web authentication
@@ -779,6 +779,7 @@ def tasks_list(request, offset=None, limit=None, window=None):
         limit = int(apiconf.tasklist.get("maxlimit"))
 
     completed_after = request.query_params.get("completed_after")
+    ids_only = request.query_params.get("ids")
     if completed_after:
         completed_after = datetime.fromtimestamp(int(completed_after))
 
@@ -792,6 +793,7 @@ def tasks_list(request, offset=None, limit=None, window=None):
 
     status = request.query_params.get("status")
     option = request.query_params.get("option")
+    category = request.query_params.get("category")
 
     if offset:
         offset = int(offset)
@@ -799,35 +801,45 @@ def tasks_list(request, offset=None, limit=None, window=None):
     resp["config"] = "Limit: {0}, Offset: {1}".format(limit, offset)
     resp["buf"] = 0
 
-    for row in db.list_tasks(
+    tasks = db.list_tasks(
         limit=limit,
         details=True,
+        category=category,
         offset=offset,
         completed_after=completed_after,
         status=status,
         options_like=option,
         order_by=Task.completed_on.desc(),
-    ):
-        resp["buf"] += 1
-        task = row.to_dict()
-        task["guest"] = {}
-        if row.guest:
-            task["guest"] = row.guest.to_dict()
+    )
 
-        task["errors"] = []
-        for error in row.errors:
-            task["errors"].append(error.message)
+    if not tasks:
+        return Response(resp)
 
-        task["sample"] = {}
-        if row.sample_id:
-            sample = db.view_sample(row.sample_id)
-            if sample:
-                task["sample"] = sample.to_dict()
+    # Dist.py fetches only ids
+    if ids_only:
+        resp["data"] = [{"id": task.id} for task in tasks]
+    else:
+        for row in tasks:
+            resp["buf"] += 1
+            task = row.to_dict()
+            task["guest"] = {}
+            if row.guest:
+                task["guest"] = row.guest.to_dict()
 
-        if task.get("target"):
-            task["target"] = convert_to_printable(task["target"])
+            task["errors"] = []
+            for error in row.errors:
+                task["errors"].append(error.message)
 
-        resp["data"].append(task)
+            task["sample"] = {}
+            if row.sample_id:
+                sample = db.view_sample(row.sample_id)
+                if sample:
+                    task["sample"] = sample.to_dict()
+
+            if task.get("target"):
+                task["target"] = convert_to_printable(task["target"])
+
+            resp["data"].append(task)
 
     return Response(resp)
 
@@ -988,9 +1000,12 @@ def tasks_reschedule(request, task_id):
         return Response(resp)
 
     resp = {}
-    if db.reschedule(task_id):
+    new_task_id = db.reschedule(task_id)
+    if new_task_id:
         resp["error"] = False
-        resp["data"] = "Task ID {0} has been rescheduled".format(task_id)
+        resp["data"] = {}
+        resp["data"]["new_task_id"] = new_task_id
+        resp["data"]["message"] = "Task ID {0} has been rescheduled".format(task_id)
     else:
         resp = {
             "error": True,
@@ -1009,34 +1024,11 @@ def tasks_reprocess(request, task_id):
         resp["error_value"] = "Task Reprocess API is Disabled"
         return Response(resp)
 
-    task = db.view_task(task_id)
-    if not task:
-        resp["error"] = True
-        resp["error_value"] = "Task ID does not exist in the database"
-        return Response(resp)
+    error, msg, task_status = db.tasks_reprocess(task_id)
+    if error:
+        return Response({"error": True, "error_value": msg})
 
-    # task status suitable for reprocessing
-    valid_status = {
-        # allow reprocessing of tasks already processed (maybe detections changed)
-        TASK_REPORTED,
-        # allow reprocessing of tasks that were rescheduled
-        TASK_RECOVERED,
-        # allow reprocessing of tasks that previously failed the processing stage
-        TASK_FAILED_PROCESSING,
-        # allow reprocessing of tasks that previously failed the reporting stage
-        TASK_FAILED_REPORTING,
-    }
-
-    if task.status not in valid_status:
-        error_fmt = "Task ID {0} cannot be reprocessed in status {1}"
-        resp["error"] = True
-        resp["error_value"] = error_fmt.format(task_id, task.status)
-        return Response(resp)
-
-    db.set_status(task_id, TASK_COMPLETED)
-    resp["error"] = False
-    resp["data"] = f"Task ID {task_id} with status {task.status} marked for reprocessing"
-    return Response(resp)
+    return Response({"error": error, "data": f"Task ID {task_id} with status {task_status} marked for reprocessing"})
 
 
 @csrf_exempt
@@ -1044,7 +1036,7 @@ def tasks_reprocess(request, task_id):
 def tasks_delete(request, task_id, status=False):
     """
     task_id: int or string if many
-    example: 1 or 1,2,3,4
+    example: 1 or 1,2,3,4 or 1-4
 
     """
     if not (apiconf.taskdelete.get("enabled") or request.user.is_staff):
@@ -1053,6 +1045,13 @@ def tasks_delete(request, task_id, status=False):
 
     if isinstance(task_id, int):
         task_id = [task_id]
+    elif "-" in task_id:
+        start, end = map(force_int, task_id.split("-"))
+        if start > end:
+            resp = {"error": True, "error_value": "Start Task ID is bigger than End Task ID"}
+            return Response(resp)
+        else:
+            task_id = list(range(start, end + 1))
     else:
         task_id = [force_int(task.strip()) for task in task_id.split(",")]
 
@@ -1085,19 +1084,35 @@ def tasks_delete(request, task_id, status=False):
 
 
 @csrf_exempt
-@api_view(["GET"])
+@api_view(["GET", "POST"])
 def tasks_status(request, task_id):
     if not apiconf.taskstatus.get("enabled"):
         resp = {"error": True, "error_value": "Task status API is disabled"}
         return Response(resp)
 
+    resp = {}
     task = db.view_task(task_id)
     if not task:
         resp = {"error": True, "error_value": "Task does not exist"}
         return Response(resp)
-
-    status = task.to_dict()["status"]
-    resp = {"error": False, "data": status}
+    if request.method == "GET":
+        status = task.to_dict()["status"]
+        resp = {"error": False, "data": status}
+    elif request.method == "POST" and apiconf.user_stop.enabled and request.data.get("status", "") == "finish":
+        machine = db.view_machine(task.guest.name)
+        # Todo probably add task status if pending
+        if machine.status == "running":
+            try:
+                guest_env = requests.get(f"http://{machine.ip}:8000/environ").json()
+                complete_folder = hashlib.md5(f"cape-{task_id}".encode()).hexdigest()
+                if machine.platform == "windows":
+                    dest_folder = f"{guest_env['environ']['TMP']}\\{complete_folder}"
+                elif machine.platform == "linux":
+                    dest_folder = f"{guest_env['environ'].get('TMP', '/tmp')}/{complete_folder}"
+                r = requests.post(f"http://{machine.ip}:8000/mkdir", data={"dirpath": dest_folder})
+                resp = {"error": r.status_code == 200, "data": r.text}
+            except requests.exceptions.ConnectionError as e:
+                log.error(e)
     return Response(resp)
 
 
@@ -1578,6 +1593,36 @@ def tasks_pcap(request, task_id):
 
 @csrf_exempt
 @api_view(["GET"])
+def tasks_evtx(request, task_id):
+    if not apiconf.taskevtx.get("enabled"):
+        resp = {"error": True, "error_value": "EVTX download API is disabled"}
+        return Response(resp)
+
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
+    evtxfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "evtx", "evtx.zip")
+    if not os.path.normpath(evtxfile).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(evtxfile)}"})
+    if path_exists(evtxfile):
+        fname = "%s_evtx.zip" % task_id
+        resp = StreamingHttpResponse(FileWrapper(open(evtxfile, "rb")), content_type="application/zip")
+        resp["Content-Length"] = os.path.getsize(evtxfile)
+        resp["Content-Disposition"] = "attachment; filename=" + fname
+        return resp
+
+    else:
+        resp = {"error": True, "error_value": "EVTX does not exist"}
+        return Response(resp)
+
+
+@csrf_exempt
+@api_view(["GET"])
 def tasks_dropped(request, task_id):
     if not apiconf.taskdropped.get("enabled"):
         resp = {"error": True, "error_value": "Dropped File download API is disabled"}
@@ -1749,37 +1794,57 @@ def tasks_procmemory(request, task_id, pid="all"):
         task_id = rtid
 
     # Check if any process memory dumps exist
-    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "memory")
+    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", f"{task_id}", "memory")
     if not path_exists(srcdir):
         resp = {"error": True, "error_value": "No memory dumps saved"}
         return Response(resp)
 
     parent_folder = os.path.dirname(srcdir)
+    analysis_dir = os.path.join(CUCKOO_ROOT, "storage", "analyses", f"{task_id}")
     if pid == "all":
         if not apiconf.taskprocmemory.get("all"):
             resp = {"error": True, "error_value": "Downloading of all process memory dumps is disabled"}
             return Response(resp)
-
-        mem_zip = create_zip(folder=srcdir, encrypted=True)
-        if mem_zip is False:
-            resp = {"error": True, "error_value": "Can't create zip archive for report file"}
-            return Response(resp)
-
-        resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
-        resp["Content-Length"] = len(mem_zip.getvalue())
-        resp["Content-Disposition"] = f"attachment; filename={task_id}_procdumps.zip"
-        return resp
-
-    else:
-        filepath = os.path.join(parent_folder, pid + ".dmp")
-        if path_exists(filepath):
-            mem_zip = create_zip(files=filepath, encrypted=True)
+        if USE_SEVENZIP:
+            zip_path = os.path.join(analysis_dir, "procdumps.zip")
+            try:
+                subprocess.check_call(["/usr/bin/7z", f"-p{settings.ZIP_PWD.decode()}", "a", zip_path, srcdir])
+            except subprocess.CalledProcessError:
+                resp = {"error": True, "error_value": "error compressing file"}
+                return Response(resp)
+            # using `with` prematurely closes the file
+            zip_fd = open(zip_path, "rb")
+            resp = StreamingHttpResponse(zip_fd, content_type="application/zip")
+            resp["Content-Length"] = os.path.getsize(zip_path)
+        else:
+            mem_zip = create_zip(folder=srcdir, encrypted=True)
             if mem_zip is False:
                 resp = {"error": True, "error_value": "Can't create zip archive for report file"}
                 return Response(resp)
-
             resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
             resp["Content-Length"] = len(mem_zip.getvalue())
+        resp["Content-Disposition"] = f"attachment; filename={task_id}_procdumps.zip"
+        return resp
+    else:
+        filepath = os.path.join(parent_folder, pid + ".dmp")
+        if path_exists(filepath):
+            if USE_SEVENZIP:
+                zip_path = os.path.join(analysis_dir, f"{task_id}-{pid}_dmp.zip")
+                try:
+                    subprocess.check_call([SEVENZIP_PATH, f"-p{settings.ZIP_PWD.decode()}", "a", zip_path, filepath])
+                except subprocess.CalledProcessError:
+                    resp = {"error": True, "error_value": "error compressing file"}
+                    return Response(resp)
+                zip_fd = open(zip_path, "rb")
+                resp = StreamingHttpResponse(zip_fd, content_type="application/zip")
+                resp["Content-Length"] = os.path.getsize(zip_path)
+            else:
+                mem_zip = create_zip(files=filepath, encrypted=True)
+                if mem_zip is False:
+                    resp = {"error": True, "error_value": "Can't create zip archive for report file"}
+                    return Response(resp)
+                resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
+                resp["Content-Length"] = len(mem_zip.getvalue())
             resp["Content-Disposition"] = f"attachment; filename={task_id}-{pid}_dmp.zip"
             return resp
         else:
@@ -1831,12 +1896,10 @@ def file(request, stype, value):
         resp = {"error": True, "error_value": "Sample download API is disabled"}
         return Response(resp)
 
+    # This Func is not Synced with views.py "def file()"
+
     file_hash = False
-    if stype == "md5":
-        file_hash = db.find_sample(md5=value).to_dict()["sha256"]
-    elif stype == "sha1":
-        file_hash = db.find_sample(sha1=value).to_dict()["sha256"]
-    elif stype == "sha256":
+    if stype in ("md5", "sha1", "sha256"):
         file_hash = value
     elif stype == "task":
         check = validate_task(value)
@@ -1846,27 +1909,50 @@ def file(request, stype, value):
         sid = db.view_task(value).to_dict()["sample_id"]
         file_hash = db.view_sample(sid).to_dict()["sha256"]
 
-    sample = os.path.join(CUCKOO_ROOT, "storage", "binaries", file_hash)
-    if path_exists(sample):
+    if not file_hash:
+        resp = {"error": True, "error_value": "Sample %s was not found" % file_hash}
+        return Response(resp)
+
+    paths = db.sample_path_by_hash(sample_hash=file_hash)
+
+    if not paths:
+        resp = {"error": True, "error_value": "Sample %s was not found" % file_hash}
+        return Response(resp)
+
+    for sample in paths:
         if request.GET.get("encrypted"):
             # Check if file exists in temp folder
-            file_exists = os.path.isfile(f"/tmp/{file_hash}.zip")
-            if not file_exists:
+            zip_path = f"/tmp/{file_hash}.zip"
+            file_exists = os.path.isfile(zip_path)
+            if file_exists:
+                resp = StreamingHttpResponse(FileWrapper(open(zip_path, "rb"), 8096), content_type="application/zip")
+                resp["Content-Disposition"] = f"attachment; filename={file_hash}.zip"
+                return resp
+
+            if USE_SEVENZIP:
+                try:
+                    subprocess.check_call([SEVENZIP_PATH, f"-p{settings.ZIP_PWD.decode()}", "a", zip_path, sample])
+                except subprocess.CalledProcessError:
+                    resp = {"error": True, "error_value": "error compressing file"}
+                    return Response(resp)
+                zip_fd = open(zip_path, "rb")
+                resp = StreamingHttpResponse(zip_fd, content_type="application/zip")
+                resp["Content-Length"] = os.path.getsize(zip_path)
+                resp["Content-Disposition"] = f"attachment; filename={file_hash}.zip"
+                return resp
+            else:
                 # If files does not exist encrypt and move to tmp folder
-                with pyzipper.AESZipFile(f"{file_hash}.zip", "w", encryption=pyzipper.WZ_AES) as zf:
+                with pyzipper.AESZipFile(zip_path, "w", encryption=pyzipper.WZ_AES) as zf:
                     zf.setpassword(b"infected")
                     zf.write(sample, os.path.basename(sample), zipfile.ZIP_DEFLATED)
-                shutil.move(f"{file_hash}.zip", "/tmp")
-            resp = StreamingHttpResponse(FileWrapper(open(f"/tmp/{file_hash}.zip", "rb"), 8096), content_type="application/zip")
-            resp["Content-Disposition"] = f"attachment; filename={file_hash}.zip"
+                resp = StreamingHttpResponse(FileWrapper(open(zip_path, "rb"), 8096), content_type="application/zip")
+                resp["Content-Disposition"] = f"attachment; filename={file_hash}.zip"
+            return resp
         else:
             resp = StreamingHttpResponse(FileWrapper(open(sample, "rb"), 8096), content_type="application/octet-stream")
             resp["Content-Length"] = os.path.getsize(sample)
             resp["Content-Disposition"] = f"attachment; filename={file_hash}.bin"
         return resp
-    else:
-        resp = {"error": True, "error_value": "Sample %s was not found" % file_hash}
-        return Response(resp)
 
 
 @csrf_exempt
@@ -1895,7 +1981,7 @@ def exit_nodes_list(request):
     resp = {}
     resp["data"] = []
     resp["error"] = False
-    resp["data"] += ["socks:" + sock5["name"] for sock5 in _load_socks5_operational() or []]
+    resp["data"] += ["socks:" + sock5 for sock5 in _load_socks5_operational() or []]
     resp["data"] += ["vpn:" + vpn for vpn in vpns.keys() or []]
     if routing_conf.tor.enabled:
         resp["data"].append("tor")
@@ -1940,12 +2026,15 @@ def cuckoo_status(request):
     else:
         resp["error"] = False
         tasks_dict_with_counts = db.get_tasks_status_count()
+        total_sum = 0
+        if isinstance(tasks_dict_with_counts, dict):
+            total_sum = sum(tasks_dict_with_counts.values())
         resp["data"] = dict(
             version=CUCKOO_VERSION,
             hostname=socket.gethostname(),
             machines=dict(total=len(db.list_machines()), available=db.count_machines_available()),
             tasks=dict(
-                total=sum(tasks_dict_with_counts.values()),
+                total=total_sum,
                 pending=tasks_dict_with_counts.get("pending", 0),
                 running=tasks_dict_with_counts.get("running", 0),
                 completed=tasks_dict_with_counts.get("completed", 0),
@@ -2211,13 +2300,10 @@ def common_download_func(service, request):
         if opts:
             opt_apikey = opts.get("apikey", False)
 
-        if not (settings.VTDL_KEY or opt_apikey) or not settings.VTDL_PATH:
+        if not (settings.VTDL_KEY or opt_apikey):
             resp = {
                 "error": True,
-                "error_value": (
-                    "You specified VirusTotal but must edit the file and specify your VTDL_KEY variable and VTDL_PATH"
-                    " base directory"
-                ),
+                "error_value": ("You specified VirusTotal but must edit the file and specify your VTDL_KEY variable"),
             }
             return Response(resp)
 
@@ -2277,6 +2363,66 @@ def common_download_func(service, request):
     else:
         resp = {"error": True, "error_value": "Error adding task to database", "errors": details["errors"]}
 
+    return Response(resp)
+
+
+@csrf_exempt
+@api_view(["POST"])
+def tasks_file_stream(request, task_id):
+    """Streams a file from the running machine with matching task_id."""
+
+    def _stream_iterator(fp, guest_name, chunk_size=1024):
+        pos = 0
+        while True:
+            machine = db.view_machine(guest_name)
+            if machine.status != "running":
+                break
+            with open(fp, "rb") as fd:
+                if pos:
+                    fd.seek(pos)
+                while True:
+                    content = fd.read(chunk_size)
+                    if not content:
+                        break
+                    yield content
+                    pos = fd.tell()
+
+    if not apiconf.taskstatus.get("enabled"):
+        resp = {"error": True, "error_value": "Task status API is disabled"}
+        return Response(resp)
+    resp = {}
+    task = db.view_task(task_id)
+    if not task:
+        resp = {"error": True, "error_value": "Task does not exist"}
+        return Response(resp)
+    machine = db.view_machine(task.guest.name)
+    if machine.status != "running":
+        resp = {"error": True, "error_value": "Machine is not running", "errors": machine.status}
+        return Response(resp)
+    filepath = request.data.get("filepath")
+    if not filepath:
+        resp = {"error": True, "error_value": "filepath not set"}
+        return Response(resp)
+    if request.data.get("is_local", ""):
+        if filepath.startswith(("/", "\/")):
+            resp = {"error": True, "error_value": "Filepath mustn't start with /"}
+            return Response(resp)
+        filepath = os.path.join(CUCKOO_ROOT, "storage", "analyses", f"{task_id}", filepath)
+        if not os.path.isfile(filepath):
+            resp = {"error": True, "error_value": "file does not exist"}
+            return Response(resp)
+        return StreamingHttpResponse(
+            streaming_content=_stream_iterator(filepath, task.guest.name), content_type="application/octet-stream"
+        )
+    try:
+        r = requests.post(f"http://{machine.ip}:8000/retrieve", stream=True, data={"filepath": filepath, "streaming": "1"})
+        if r.status_code >= 400:
+            resp = {"error": True, "error_value": f"{filepath} does not exist"}
+            return Response(resp)
+        return StreamingHttpResponse(streaming_content=r.iter_content(chunk_size=1024), content_type="application/octet-stream")
+    except requests.exceptions.RequestException as ex:
+        log.error(ex, exc_info=True)
+        resp = {"error": True, "error_value": f"Requests exception: {ex}"}
     return Response(resp)
 
 

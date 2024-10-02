@@ -2,13 +2,16 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import copy
 import logging
+import pathlib
 import tempfile
 
 import pytest
 import yara
 
-from lib.cuckoo.common.objects import Dictionary, File  # ,ProcDump
+from lib.cuckoo.common.dictionary import Dictionary  # ,ProcDump
+from lib.cuckoo.common.objects import File  # ,ProcDump
 from lib.cuckoo.common.path_utils import path_delete, path_write_file
 
 # from tcr_misc import get_sample, random_string
@@ -25,6 +28,12 @@ class TestDictionary:
         assert "foo" == dict_cfg.a
         dict_cfg.a = "bar"
         assert "bar" == dict_cfg.a
+
+    def test_deepcopy(self, dict_cfg):
+        dict_cfg.foo = "bar"
+        dict_cfg2 = copy.deepcopy(dict_cfg)
+        assert dict_cfg2 is not dict_cfg
+        assert dict_cfg2 == dict_cfg
 
     def test_exception(self, dict_cfg):
         with pytest.raises(AttributeError):
@@ -90,6 +99,7 @@ class TestEmptyFile:
             assert key in empty_file["file"].get_all()[0]
 
 
+@pytest.mark.skipif(not (pathlib.Path(__file__).parent / "data" / "malware").exists(), reason="Required data file is not present")
 def test_filetype():
     filetype = File("tests/data/malware/53622590bb3138dcbf12b0105af96dd72aedc40de8984f97c8e882343a769b45").get_type()
     assert filetype == "PE32 executable (GUI) Intel 80386 Mono/.Net assembly, for MS Windows"
@@ -208,6 +218,23 @@ class TestFiles:
             assert sample["download_location"].get_type() == sample["get_type_str"]
             print(("Verified that " + sample["download_location"].file_path + " == " + sample["get_type_str"]))
 
+    @pytest.mark.parametrize(
+        "file_fixture,expected,is_pe",
+        [
+            ("temp_pe32", "PE32 executable (GUI) Intel 80386, for MS Windows", True),  # emulated magic type
+            ("temp_pe64", "PE32+ executable (GUI) x86-64, for MS Windows", True),  # emulated magic type
+            ("temp_pe_aarch64", "MS-DOS executable PE32 executable Aarch64, for MS Windows", True),
+            ("temp_elf32", "ELF 32-bit LSB", False),
+            ("temp_elf64", "ELF 64-bit LSB", False),
+            ("temp_macho_arm64", "Mach-O 64-bit arm64 executable", False),
+        ],
+    )
+    def test_get_type_pe(self, file_fixture, expected, is_pe, request):
+        path = request.getfixturevalue(file_fixture)
+        file = File(path)
+        assert file.get_type() == expected
+        assert bool(file.pe) == is_pe
+
     def test_get_yara(self, hello_file, yara_compiled):
         File.yara_rules = {"hello": yara_compiled}
         assert hello_file["file"].get_yara(category="hello") == [
@@ -217,6 +244,29 @@ class TestFiles:
     @pytest.mark.skip(reason="TODO - init yara was removed from objects.py it was init in too many not related parts")
     def test_get_yara_no_categories(self, test_files):
         assert not test_files[0]["download_location"].get_yara()
+
+    def test_get_platform_windows(self, temp_pe32, temp_pe64):
+        assert "windows" == File(temp_pe32).get_platform()
+        assert "windows" == File(temp_pe64).get_platform()
+
+    def test_get_platform_linux(self, temp_elf32, temp_elf64):
+        assert "linux" == File(temp_elf32).get_platform()
+        assert "linux" == File(temp_elf64).get_platform()
+
+    def test_get_platform_darwin(self, temp_macho_arm64):
+        assert "darwin" == File(temp_macho_arm64).get_platform()
+
+    def test_predict_arch_x86(self, temp_pe32, temp_elf32):
+        assert "x86" == File(temp_pe32).predict_arch()
+        assert "x86" == File(temp_elf32).predict_arch()
+
+    def test_predict_arch_x64(self, temp_pe64, temp_elf64, temp_macho_arm64):
+        assert "x64" == File(temp_pe64).predict_arch()
+        assert "x64" == File(temp_elf64).predict_arch()
+        assert "x64" == File(temp_macho_arm64).predict_arch()
+
+    def test_predict_arch_none(self, empty_file):
+        assert None is empty_file["file"].predict_arch()
 
 
 class TestMisc:

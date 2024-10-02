@@ -7,7 +7,15 @@ import json
 import logging
 import os
 import socket
+import struct
+from contextlib import suppress
 from threading import Lock, Thread
+
+HAVE_BSON = False
+with suppress(ImportError):
+    import bson
+
+    HAVE_BSON = True
 
 import gevent.pool
 import gevent.server
@@ -20,10 +28,10 @@ from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooCriticalError, CuckooOperationalError
 from lib.cuckoo.common.files import open_exclusive, open_inclusive
-from lib.cuckoo.common.path_utils import path_exists
+from lib.cuckoo.common.path_utils import path_exists, path_get_filename
 
 # from lib.cuckoo.common.netlog import BsonParser
-from lib.cuckoo.common.utils import Singleton, create_folder, load_categories
+from lib.cuckoo.common.utils import Singleton, create_folder, default_converter, load_categories
 from lib.cuckoo.core.log import task_log_start, task_log_stop
 
 log = logging.getLogger(__name__)
@@ -47,17 +55,21 @@ BANNED_PATH_CHARS = b"\x00:"
 RESULT_UPLOADABLE = (
     b"CAPE",
     b"aux",
+    b"aux/amsi",
+    b"browser",
     b"curtain",
     b"debugger",
-    b"tlsdump",
+    b"evtx",
     b"files",
+    b"htmldump",
     b"memory",
     b"procdump",
     b"shots",
     b"sysmon",
-    b"stap",
-    b"evtx",
+    b"tlsdump",
+    b"tracee",
 )
+
 RESULT_DIRECTORIES = RESULT_UPLOADABLE + (b"reports", b"logs")
 
 
@@ -106,9 +118,11 @@ class HandlerContext:
 
     def read(self):
         try:
+            # Test
+            self.sock.settimeout(None)
             return self.sock.recv(16384)
         except socket.timeout as e:
-            print("Do we need to fix it?", e)
+            print(f"Do we need to fix it?. <Context for {self.command}>", e)
             return b""
         except socket.error as e:
             if e.errno == errno.EBADF:
@@ -153,6 +167,11 @@ class HandlerContext:
             fd.write(buf)
         fd.flush()
 
+    def discard(self):
+        self.drain_buffer()
+        while _ := self.read():
+            pass
+
 
 class WriteLimiter:
     def __init__(self, fd, remain):
@@ -163,14 +182,17 @@ class WriteLimiter:
     def write(self, buf):
         size = len(buf)
         write = min(size, self.remain)
-        if write:
-            self.fd.write(buf[:write])
-            self.remain -= write
-        if size and size != write:
-            if not self.warned:
-                log.warning("Uploaded file length larger than upload_max_size, stopping upload")
-                self.fd.write(b"... (truncated)")
-                self.warned = True
+        try:
+            if write:
+                self.fd.write(buf[:write])
+                self.remain -= write
+            if size and size != write:
+                if not self.warned:
+                    log.warning("Uploaded file length larger than upload_max_size, stopping upload")
+                    self.fd.write(b"... (truncated)")
+                    self.warned = True
+        except Exception as e:
+            log.debug("Failed to upload file due to '%s'", e)
 
     def flush(self):
         self.fd.flush()
@@ -188,6 +210,10 @@ class FileUpload(ProtocolHandler):
         # shots/0001.jpg or files/9498687557/libcurl-4.dll.bin
         self.handler.sock.settimeout(30)
         dump_path = netlog_sanitize_fname(self.handler.read_newline())
+        if cfg.cuckoo.machinery_screenshots and dump_path.startswith(b"shots/"):
+            log.debug("Task #%s: discarding screenshot; machinery screenshots enabled", self.task_id)
+            self.handler.discard()
+            return
 
         if self.version and self.version >= 2:
             # NB: filepath is only used as metadata
@@ -200,7 +226,7 @@ class FileUpload(ProtocolHandler):
         else:
             filepath, pids, ppids, metadata, category, duplicated = None, [], [], b"", b"", False
 
-        log.debug("Task #%s: Trying to upload file %s", self.task_id, dump_path.decode())
+        log.debug("Task #%s: Uploading file %s", self.task_id, dump_path.decode())
         if not duplicated:
             file_path = os.path.join(self.storagepath, dump_path.decode())
 
@@ -219,7 +245,9 @@ class FileUpload(ProtocolHandler):
                 raise
         # ToDo we need Windows path
         # filter screens/curtain/sysmon
-        if not dump_path.startswith((b"shots/", b"curtain/", b"aux/", b"sysmon/", b"debugger/", b"tlsdump/", b"evtx")):
+        if not dump_path.startswith(
+            (b"shots/", b"curtain/", b"aux/", b"sysmon/", b"debugger/", b"tlsdump/", b"evtx", b"htmldump/")
+        ):
             # Append-writes are atomic
             with open(self.filelog, "a") as f:
                 print(
@@ -241,8 +269,17 @@ class FileUpload(ProtocolHandler):
             self.handler.sock.settimeout(None)
             try:
                 return self.handler.copy_to_fd(self.fd, self.upload_max_size)
-            finally:
-                log.debug("Task #%s: Uploaded file %s of length: %s", self.task_id, dump_path.decode(), self.fd.tell())
+            except Exception as e:
+                if self.fd:
+                    log.debug(
+                        "Task #%s: Failed to uploaded file %s of length %s due to '%s'",
+                        self.task_id,
+                        dump_path.decode(),
+                        self.fd.tell(),
+                        e,
+                    )
+                else:
+                    log.debug("Task #%s: Failed to uploaded file %s due to '%s'", self.task_id, dump_path.decode(), e)
 
 
 class LogHandler(ProtocolHandler):
@@ -263,6 +300,26 @@ class LogHandler(ProtocolHandler):
             return self.handler.copy_to_fd(self.fd)
 
 
+TYPECONVERTERS = {"h": lambda v: f"0x{default_converter(v):08x}", "p": lambda v: f"0x{default_converter(v):08x}"}
+
+
+def check_names_for_typeinfo(arginfo):
+    argnames = [i[0] if isinstance(i, (list, tuple)) else i for i in arginfo]
+
+    converters = []
+    for i in arginfo:
+        if isinstance(i, (list, tuple)):
+            r = TYPECONVERTERS.get(i[1])
+            if not r:
+                log.debug("Analyzer sent unknown format specifier '%s'", i[1])
+                r = default_converter
+            converters.append(r)
+        else:
+            converters.append(default_converter)
+
+    return argnames, converters
+
+
 class BsonStore(ProtocolHandler):
     def init(self):
         if self.version is None:
@@ -270,12 +327,81 @@ class BsonStore(ProtocolHandler):
             self.fd = None
             return
 
+        self.infomap = {}
         self.fd = open(os.path.join(self.handler.storagepath, "logs", f"{self.version}.bson"), "wb")
+
+    def parse_message(self, buffer):
+        if not HAVE_BSON:
+            log.debug("Task #%s is sending a BSON stream for pid %d", self.task_id, self.version)
+            return
+
+        while True:
+            data = buffer[:4]
+            if not data:
+                return
+
+            blen = struct.unpack("I", data)[0]
+            data = buffer[:blen]
+            buffer = buffer[blen:]
+
+            if len(data) < blen:
+                log.debug("BsonParser lacking data")
+                return
+
+            try:
+                dec = bson.decode(data)
+            except Exception as e:
+                log.warning("BsonParser decoding problem %s on data[:50] %s", e, data[:50])
+                return
+
+            mtype = dec.get("type", "none")
+            index = dec.get("I", -1)
+
+            if mtype == "info":
+                name = dec.get("name", "NONAME")
+                arginfo = dec.get("args", [])
+                category = dec.get("category")
+
+                if not category:
+                    category = "unknown"
+
+                argnames, converters = check_names_for_typeinfo(arginfo)
+                self.infomap[index] = name, arginfo, argnames, converters, category
+
+            else:
+                if index not in self.infomap:
+                    log.warning("Got API with unknown index - monitor needs to explain first: %s", dec)
+                    return
+
+                apiname, arginfo, argnames, converters, category = self.infomap[index]
+                args = dec.get("args", [])
+
+                if len(args) != len(argnames):
+                    log.warning("Inconsistent arg count (compared to arg names) on %s: %s names %s", dec, argnames, apiname)
+                    continue
+
+                argdict = {argnames[i]: converters[i](arg) for i, arg in enumerate(args)}
+
+                if apiname == "__process__":
+
+                    # pid = argdict["ProcessIdentifier"]
+                    ppid = argdict["ParentProcessIdentifier"]
+                    modulepath = argdict["ModulePath"]
+                    procname = path_get_filename(modulepath)
+
+                    log.info(
+                        "Task %d: Process %d (parent %d): %s, path %s",
+                        self.task_id,
+                        self.version,
+                        ppid,
+                        procname,
+                        modulepath.decode(),
+                    )
 
     def handle(self):
         """Read a BSON stream, attempting at least basic validation, and
         log failures."""
-        log.debug("Task #%s is sending a BSON stream for pid %d", self.task_id, self.version)
+        self.parse_message(self.handler.buf)
         if self.fd:
             self.handler.sock.settimeout(None)
             return self.handler.copy_to_fd(self.fd)
@@ -429,7 +555,12 @@ class ResultServer(metaclass=Singleton):
             sock.bind((ip, port))
         except (OSError, socket.error) as e:
             if e.errno == errno.EADDRINUSE:
-                raise CuckooCriticalError(f"Cannot bind ResultServer on port {port} because it was in use, bailing")
+                raise CuckooCriticalError(
+                    f"Cannot bind ResultServer on port {port} because it was in use, bailing"
+                    "This might happen because CAPE is already running in the background as cape.service"
+                    "sudo systemctl stop cape.service"
+                    "to stop the background service. You can also run the just use the background service without starting it again here in the terminal."
+                )
             elif e.errno == errno.EADDRNOTAVAIL:
                 raise CuckooCriticalError(
                     f"Unable to bind ResultServer on {ip}:{port} {e}. This "
@@ -438,6 +569,8 @@ class ResultServer(metaclass=Singleton):
                     "the ResultServer IP address. Please refer to "
                     "https://cuckoo.sh/docs/faq/#troubles-problem "
                     "for more information"
+                    "One more reason this might happen is if you don't correctly set the IP of the resultserver in cuckoo.conf."
+                    "Make sure the resultserver IP is set to the host IP"
                 )
             else:
                 raise CuckooCriticalError(f"Unable to bind ResultServer on {ip}:{port} {e}")

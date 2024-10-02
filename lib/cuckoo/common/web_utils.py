@@ -1,30 +1,38 @@
 import hashlib
+import io
 import json
 import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from random import choice
+from typing import Dict, List, Optional
 
 import magic
 import requests
 from django.http import HttpResponse
 
+HAVE_PYZIPPER = False
+with suppress(ImportError):
+    import pyzipper
+
+    HAVE_PYZIPPER = True
+
+from dev_utils.mongo_hooks import FILE_REF_KEY, FILES_COLL, NORMALIZED_FILE_FIELDS
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.integrations.parse_pe import HAVE_PEFILE, IsPEImage, pefile
 from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_exists, path_mkdir, path_write_file
 from lib.cuckoo.common.utils import (
-    bytes2str,
     generate_fake_name,
     get_ip_address,
     get_options,
-    get_platform,
     get_user_filename,
     sanitize_filename,
     store_temp_file,
@@ -101,13 +109,6 @@ if repconf.elasticsearchdb.enabled:
 
     es = elastic_handler
 
-hash_len = {
-    32: "md5",
-    40: "sha1",
-    64: "sha256",
-    128: "sha512",
-}
-
 hashes = {
     32: hashlib.md5,
     40: hashlib.sha1,
@@ -176,45 +177,100 @@ def my_rate_minutes(group, request):
     return rpm
 
 
-def load_vms_exits():
-    all_exits = {}
-    if HAVE_DIST and dist_conf.distributed.enabled:
-        try:
-            db = dist_session()
-            for node in db.query(Node).all():
-                if hasattr(node, "exitnodes"):
-                    for exit in node.exitnodes:
-                        all_exits.setdefault(exit.name, []).append(node.name)
-            db.close()
-        except Exception as e:
-            print(e)
-
-    return all_exits
+_all_nodes_exits: Optional[Dict[str, List[str]]] = None
+_load_vms_exits_lock = threading.Lock()
 
 
-def load_vms_tags():
-    all_tags = []
-    if HAVE_DIST and dist_conf.distributed.enabled:
-        try:
-            db = dist_session()
-            for vm in db.query(Machine).all():
-                all_tags += vm.tags
-            all_tags = sorted(filter(None, all_tags))
-            db.close()
-        except Exception as e:
-            print(e)
+def load_vms_exits(force=False):
+    global _all_nodes_exits
+    with _load_vms_exits_lock:
+        if _all_nodes_exits is not None and not force:
+            return _all_nodes_exits
+        _all_nodes_exits = {}
+        if HAVE_DIST and dist_conf.distributed.enabled:
+            try:
+                db = dist_session()
+                for node in db.query(Node).all():
+                    if hasattr(node, "exitnodes"):
+                        for exit in node.exitnodes:
+                            _all_nodes_exits.setdefault(exit.name, []).append(node.name)
+                db.close()
+            except Exception as e:
+                print(e)
 
-    for machine in Database().list_machines():
-        all_tags += [tag.name for tag in machine.tags if tag not in all_tags]
-
-    return list(set(all_tags))
+        return _all_nodes_exits
 
 
-all_nodes_exits = load_vms_exits()
-all_nodes_exits_list = list(all_nodes_exits.keys())
+_all_vms_tags: Optional[List[str]] = None
+_load_vms_tags_lock = threading.Lock()
 
-all_vms_tags = load_vms_tags()
-all_vms_tags_str = ",".join(all_vms_tags)
+
+def load_vms_tags(force=False):
+    global _all_vms_tags
+    with _load_vms_tags_lock:
+        if _all_vms_tags is not None and not force:
+            return _all_vms_tags
+        all_tags = []
+        if HAVE_DIST and dist_conf.distributed.enabled:
+            try:
+                db = dist_session()
+                for vm in db.query(Machine).all():
+                    all_tags += vm.tags
+                all_tags = sorted(filter(None, all_tags))
+                db.close()
+            except Exception as e:
+                print(e)
+
+        for machine in Database().list_machines(include_reserved=True):
+            all_tags += [tag.name for tag in machine.tags if tag not in all_tags]
+
+        _all_vms_tags = list(sorted(set(all_tags)))
+        return _all_vms_tags
+
+
+def top_asn(date_since: datetime = False, results_limit: int = 20) -> dict:
+    if web_cfg.general.get("top_asn", False) is False:
+        return False
+
+    t = int(time.time())
+
+    # caches results for 10 minutes
+    if hasattr(top_asn, "cache"):
+        ct, data = top_asn.cache
+        if t - ct < 600:
+            return data
+
+    """function that gets detection: count
+    Original: https://gist.github.com/clarkenheim/fa0f9e5400412b6a0f9d
+    New: https://stackoverflow.com/a/21509359/1294762
+    """
+
+    aggregation_command = [
+        {"$match": {"network.hosts.asn": {"$exists": True}}},
+        {"$project": {"_id": 0, "network.hosts.asn": 1}},
+        {"$unwind": "$network.hosts"},
+        {"$group": {"_id": "$network.hosts.asn", "total": {"$sum": 1}}},
+        {"$sort": {"total": -1}},
+        {"$addFields": {"asn": "$_id"}},
+        {"$project": {"_id": 0}},
+        {"$limit": results_limit},
+    ]
+
+    if date_since:
+        aggregation_command[0]["$match"].setdefault("info.started", {"$gte": date_since.isoformat()})
+
+    if repconf.mongodb.enabled:
+        data = mongo_aggregate("analysis", aggregation_command)
+    else:
+        data = False
+
+    if data:
+        data = list(data)
+
+    # save to cache
+    top_asn.cache = (t, data)
+
+    return data
 
 
 def top_detections(date_since: datetime = False, results_limit: int = 20) -> dict:
@@ -355,12 +411,14 @@ def statistics(s_days: int) -> dict:
             details[module_name.split(".")[-1]].setdefault(name, entry)
 
     top_samples = {}
-    session = db.Session()
     added_tasks = (
-        session.query(Task).join(Sample, Task.sample_id == Sample.id).filter(Task.added_on.between(date_since, date_till)).all()
+        db.session.query(Task).join(Sample, Task.sample_id == Sample.id).filter(Task.added_on.between(date_since, date_till)).all()
     )
     tasks = (
-        session.query(Task).join(Sample, Task.sample_id == Sample.id).filter(Task.completed_on.between(date_since, date_till)).all()
+        db.session.query(Task)
+        .join(Sample, Task.sample_id == Sample.id)
+        .filter(Task.completed_on.between(date_since, date_till))
+        .all()
     )
     details["total"] = len(tasks)
     details["average"] = f"{round(details['total'] / s_days, 2):.2f}"
@@ -427,8 +485,8 @@ def statistics(s_days: int) -> dict:
     )
 
     details["detections"] = top_detections(date_since=date_since)
+    details["asns"] = top_asn(date_since=date_since)
 
-    session.close()
     return details
 
 
@@ -474,72 +532,6 @@ def fix_section_permission(path):
         pe.close()
     except Exception as e:
         log.info(e)
-
-
-# Submission hooks to manipulate arguments of tasks execution
-def recon(
-    filename,
-    orig_options,
-    timeout,
-    enforce_timeout,
-    package,
-    tags,
-    static,
-    priority,
-    machine,
-    platform,
-    custom,
-    memory,
-    clock,
-    unique,
-    referrer,
-    tlp,
-    tags_tasks,
-    route,
-    cape,
-):
-    if not isinstance(filename, str):
-        filename = bytes2str(filename)
-
-    if web_cfg.general.yara_recon:
-        hits = File(filename).get_yara("binaries")
-        for hit in hits:
-            cape_name = hit["meta"].get("cape_type", "")
-            if not cape_name.endswith(("Crypter", "Packer", "Obfuscator", "Loader")):
-                continue
-
-            parsed_options = get_options(hit["meta"].get("cape_options", ""))
-            if "tags" in parsed_options:
-                tags = "," + parsed_options["tags"] if tags else parsed_options["tags"]
-            # custom packages should be added to lib/cuckoo/core/database.py -> sandbox_packages list
-            if "package" in parsed_options:
-                package = parsed_options["package"]
-
-    if "name" in filename.lower():
-        orig_options += ",timeout=400,enforce_timeout=1,procmemdump=1,procdump=1"
-        timeout = 400
-        enforce_timeout = True
-
-    return (
-        static,
-        priority,
-        machine,
-        platform,
-        custom,
-        memory,
-        clock,
-        unique,
-        referrer,
-        tlp,
-        tags_tasks,
-        route,
-        cape,
-        orig_options,
-        timeout,
-        enforce_timeout,
-        package,
-        tags,
-    )
 
 
 def get_magic_type(data):
@@ -626,14 +618,11 @@ def download_file(**kwargs):
         elif socks5s_random:
             route = socks5s_random
 
-    if package:
-        if package == "Emotet":
-            return "error", {"error": "Hey guy update your script, this package doesn't exist anymore"}
-
     if tags:
+        all_vms_tags = load_vms_tags()
         if not all([tag.strip() in all_vms_tags for tag in tags.split(",")]):
             return "error", {
-                "error": f"Check Tags help, you have introduced incorrect tag(s). Your tags: {tags} - Supported tags: {all_vms_tags_str}"
+                "error": f"Check Tags help, you have introduced incorrect tag(s). Your tags: {tags} - Supported tags: {','.join(all_vms_tags)}"
             }
         elif all([tag in tags for tag in ("x64", "x86")]):
             return "error", {"error": "Check Tags help, you have introduced x86 and x64 tags for the same task, choose only 1"}
@@ -661,7 +650,7 @@ def download_file(**kwargs):
         else:
             return "error", {"error": f"Was impossible to download from {kwargs['service']}"}
 
-    if not kwargs["content"]:
+    if not kwargs.get("content"):
         return "error", {"error": f"Error downloading file from {kwargs['service']}"}
     try:
         if kwargs.get("fhash", False):
@@ -677,13 +666,14 @@ def download_file(**kwargs):
         return "error", {"error": f"Error writing {kwargs['service']} storing/download file to temporary path"}
 
     # Distribute task based on route support by worker
-    if route and route not in ("none", "None") and all_nodes_exits_list:
+    all_nodes_exits = load_vms_exits()
+    if route and route not in ("none", "None") and all_nodes_exits:
         parsed_options = get_options(kwargs["options"])
         node = parsed_options.get("node")
 
-        if node and route not in all_nodes_exits.get(node):
+        if node and node not in all_nodes_exits.get(route):
             return "error", {"error": f"Specified worker {node} doesn't support this route: {route}"}
-        elif route not in all_nodes_exits_list:
+        elif route not in all_nodes_exits:
             return "error", {"error": "Specified route doesn't exist on any worker"}
 
         if not node:
@@ -696,8 +686,8 @@ def download_file(**kwargs):
                     kwargs["options"] = f"node={choice(tmp_workers)}"
 
         # Remove workers prefixes
-        if route.startswith(("socks5:", "vpn:")):
-            route = route.replace("socks5:", "", 1).replace("vpn:", "", 1)
+        if route.startswith(("socks5:", "vpn:", "socks:")):
+            route = route.replace("socks5:", "", 1).replace("vpn:", "", 1).replace("socks:", "", 1)
 
     onesuccess = True
     magic_type = get_magic_type(kwargs["path"])
@@ -705,52 +695,11 @@ def download_file(**kwargs):
         if len(kwargs["request"].FILES) == 1:
             return "error", {"error": "Sorry no x64 support yet"}
 
-    (
-        static,
-        priority,
-        machine,
-        platform,
-        custom,
-        memory,
-        clock,
-        unique,
-        referrer,
-        tlp,
-        tags_tasks,
-        route,
-        cape,
-        kwargs["options"],
-        timeout,
-        enforce_timeout,
-        package,
-        tags,
-    ) = recon(
-        kwargs["path"],
-        kwargs["options"],
-        timeout,
-        enforce_timeout,
-        package,
-        tags,
-        static,
-        priority,
-        machine,
-        platform,
-        custom,
-        memory,
-        clock,
-        unique,
-        referrer,
-        tlp,
-        tags_tasks,
-        route,
-        cape,
-    )
-
     if not kwargs.get("task_machines", []):
         kwargs["task_machines"] = [None]
 
     if DYNAMIC_PLATFORM_DETERMINATION:
-        platform = get_platform(magic_type)
+        platform = File(kwargs["path"]).get_platform()
     if platform == "linux" and not linux_enabled and "Python" not in magic_type:
         return "error", {"error": "Linux binaries analysis isn't enabled"}
 
@@ -896,7 +845,9 @@ def category_all_files(task_id, category, base_path):
     if category == "CAPE":
         category = "CAPE.payloads"
     if repconf.mongodb.enabled:
-        analysis = mongo_find_one("analysis", {"info.id": int(task_id)}, {f"{category}.sha256": 1, "_id": 0}, sort=[("_id", -1)])
+        analysis = mongo_find_one(
+            "analysis", {"info.id": int(task_id)}, {f"{category}.{FILE_REF_KEY}": 1, "_id": 0}, sort=[("_id", -1)]
+        )
     # if es_as_db:
     #    # ToDo missed category
     #    analysis = es.search(index=get_analysis_index(), query=get_query_by_info_id(task_id))["hits"]["hits"][0]["_source"]
@@ -924,16 +875,14 @@ def validate_task(tid, status=TASK_REPORTED):
         return {"error": True, "error_value": "Specified wrong task status"}
     elif status == task.status:
         if tid != task_id:
-            return {"error": False, "rtid": task_id}
-        else:
-            return {"error": False}
-        return {"error": False}
+            return {"error": False, "rtid": task_id, "tlp": task.tlp}
+        return {"error": False, "tlp": task.tlp}
     elif task.status in {TASK_FAILED_ANALYSIS, TASK_FAILED_PROCESSING, TASK_FAILED_REPORTING}:
         return {"error": True, "error_value": "Task failed"}
     elif task.status != TASK_REPORTED:
         return {"error": True, "error_value": "Task is still being analyzed"}
 
-    return {"error": False}
+    return {"error": False, "tlp": task.tlp}
 
 
 def validate_task_by_path(tid):
@@ -964,6 +913,16 @@ perform_search_filters = {
     "_id": 0,
 }
 
+hash_searches = {
+    "ssdeep": "ssdeep",
+    "crc32": "crc32",
+    "md5": "md5",
+    "sha1": "sha1",
+    "sha3": "sha3_384",
+    "sha256": "sha256",
+    "sha512": "sha512",
+}
+
 search_term_map = {
     "id": "info.id",
     "ids": "info.id",
@@ -971,13 +930,8 @@ search_term_map = {
     "package": "info.package",
     "ttp": "ttps.ttp",
     "malscore": "malscore",
-    "user_tasks": True,
     "name": "target.file.name",
     "type": "target.file.type",
-    "string": "strings",
-    "ssdeep": ("info.parent_sample.ssdeep", "target.file.ssdeep", "dropped.ssdeep", "procdump.ssdeep", "CAPE.payloads.ssdeep"),
-    "trid": "trid",
-    "crc32": ("info.parent_sample.crc32", "target.file.crc32", "dropped.crc32", "procdump.crc32", "CAPE.payloads.crc32"),
     "file": "behavior.summary.files",
     "command": "behavior.summary.executed_commands",
     "configs": "CAPE.configs",
@@ -986,14 +940,14 @@ search_term_map = {
     "mutex": "behavior.summary.mutexes",
     "domain": "network.domains.domain",
     "ip": "network.hosts.ip",
+    "asn": "network.hosts.asn",
+    "asn_name": "network.hosts.asn_name",
     "signature": "signatures.description",
     "signame": "signatures.name",
     "detections": "detections.family",
     "url": "target.url",
     "iconhash": "static.pe.icon_hash",
     "iconfuzzy": "static.pe.icon_fuzzy",
-    # probably needs extend
-    "imphash": "static.pe.imphash",
     "surihttp": "suricata.http",
     "suritls": "suricata.tls",
     "surisid": "suricata.alerts.sid",
@@ -1005,7 +959,8 @@ search_term_map = {
     "suritlssubject": "suricata.tls.subject",
     "suritlsissuerdn": "suricata.tls.issuer",
     "suritlsfingerprint": "suricata.tls.fingerprint",
-    "procmemyara": "procmemory.yara.name",
+    "procmemyara": ("procmemory.yara.name", "procmemory.cape_yara.name"),
+    "procdumpyara": ("procdump.yara.name", "procdump.cape_yara.name"),
     "virustotal": "virustotal.results.sig",
     "machinename": "info.machine.name",
     "machinelabel": "info.machine.label",
@@ -1016,39 +971,10 @@ search_term_map = {
     "shrikesid": "info.shrike_sid",
     "custom": "info.custom",
     # initial binary
-    "target_sha256": "target.file.sha256",
-    # should be on all
-    "clamav": ("info.parent_sample.clamav", "target.file.clamav", "dropped.clamav", "procdump.clamav", "CAPE.payloads.clamav"),
-    "yaraname": (
-        "info.parent_sample.yara.name",
-        "target.file.yara.name",
-        "dropped.yara.name",
-        "procdump.yara.name",
-        "CAPE.payloads.yara.name",
-    ),
-    "capeyara": (
-        "info.parent_sample.cape_yara.name",
-        "target.file.cape_yara.name",
-        "dropped.cape_yara.name",
-        "procdump.cape_yara.name",
-        "CAPE.payloads.cape_yara.name",
-    ),
-    "capetype": (
-        "info.parent_sample.cape_type",
-        "target.file.cape_type",
-        "dropped.cape_type",
-        "procdump.cape_type",
-        "CAPE.payloads.cape_type",
-    ),
-    "md5": ("info.parent_sample.md5", "target.file.md5", "dropped.md5", "procdump.md5", "CAPE.payloads.md5"),
-    "sha1": ("info.parent_sample.sha1", "target.file.sha1", "dropped.sha1", "procdump.sha1", "CAPE.payloads.sha1"),
-    "sha3": ("info.parent_sample.sha3", "target.file.sha3_384", "dropped.sha3_384", "procdump.sha3_384", "CAPE.payloads.sha3_384"),
-    "sha256": ("info.parent_sample.sha256", "target.file.sha256", "dropped.sha256", "procdump.sha256", "CAPE.payloads.sha256"),
-    "sha512": ("info.parent_sample.sha512", "target.file.sha512", "dropped.sha512", "procdump.sha512", "CAPE.payloads.sha512"),
+    "target_sha256": ("target.file.sha256", f"target.file.{FILE_REF_KEY}"),
     "tlp": "info.tlp",
     "ja3_hash": "suricata.tls.ja3.hash",
     "ja3_string": "suricata.tls.ja3.string",
-    "payloads": "CAPE.payloads.",
     "dhash": "static.pe.icon_dhash",
     "dport": ("network.tcp.dport", "network.udp.dport", "network.smtp_ex.dport"),
     "sport": ("network.tcp.dport", "network.udp.dport", "network.smtp_ex.dport"),
@@ -1060,7 +986,6 @@ search_term_map = {
         "network.udp.dport",
         "network.smtp_ex.dport",
     ),
-    "die": ("target.file.die", "dropped.die", "procdump.die", "CAPE.payloads.die"),
     # File_extra_info
     "extracted_tool": (
         "info.parent_sample.extracted_files_tool",
@@ -1070,6 +995,30 @@ search_term_map = {
         "CAPE.payloads.extracted_files_tool",
     ),
 }
+
+search_term_map_repetetive_blocks = {
+    "ssdeep": "ssdeep",
+    "clamav": "clamav",
+    "yaraname": "yara.name",
+    "capeyara": "cape_yara.name",
+    "capetype": "cape_type.name",
+    "md5": "md5",
+    "sha1": "sha1",
+    "sha256": "sha256",
+    "sha3": "sha3_384",
+    "sha512": "sha512",
+    "crc32": "crc32",
+    "die": "die",
+    "trid": "trid",
+    "imphash": "imphash",
+}
+
+search_term_map_base_naming = (
+    ("info.parent_sample",) + NORMALIZED_FILE_FIELDS + tuple(f"{category}.extracted_files" for category in NORMALIZED_FILE_FIELDS)
+)
+
+for key, value in search_term_map_repetetive_blocks.items():
+    search_term_map.update({key: [f"{path}.{value}" for path in search_term_map_base_naming]})
 
 # search terms that will be forwarded to mongodb in a lowered normalized form
 normalized_lower_terms = (
@@ -1095,7 +1044,7 @@ normalized_int_terms = (
 )
 
 
-def perform_search(term, value, search_limit=False, user_id=False, privs=False, web=True):
+def perform_search(term, value, search_limit=False, user_id=False, privs=False, web=True, projection=None):
     if repconf.mongodb.enabled and repconf.elasticsearchdb.enabled and essearch and not term:
         multi_match_search = {"query": {"multi_match": {"query": value, "fields": ["*"]}}}
         numhits = es.search(index=get_analysis_index(), body=multi_match_search, size=0)["hits"]["total"]
@@ -1160,9 +1109,6 @@ def perform_search(term, value, search_limit=False, user_id=False, privs=False, 
     if not search_limit:
         search_limit = web_cfg.general.get("search_limit", 50)
 
-    if term == "payloads" and len(value) in (32, 40, 64, 128):
-        search_term_map[term] = f"CAPE.payloads.{hash_len.get(len(value))}"
-
     elif term == "configs":
         # check if family name is string only maybe?
         search_term_map[term] = f"CAPE.configs.{value}"
@@ -1172,8 +1118,40 @@ def perform_search(term, value, search_limit=False, user_id=False, privs=False, 
         if isinstance(search_term_map[term], str):
             mongo_search_query = {search_term_map[term]: query_val}
         else:
-            mongo_search_query = {"$or": [{search_term: query_val} for search_term in search_term_map[term]]}
-        return mongo_find("analysis", mongo_search_query, perform_search_filters).sort([["_id", -1]]).limit(search_limit)
+            search_terms = [{search_term: query_val} for search_term in search_term_map[term]]
+            if term in hash_searches:
+                # For analyses where files have been stored in the "files" collection, search
+                # there for the _id (i.e. sha256) of documents matching the given hash. As a
+                # special case, we don't need to do that query if the requested hash type is
+                # "sha256" since that's what's stored in the "file_refs" key.
+                # We do all this in addition to search the old keys for backwards-compatibility
+                # with documents that do not use this mechanism for storing file data.
+                if term == "sha256":
+                    file_refs = [query_val]
+                else:
+                    file_docs = mongo_find(FILES_COLL, {hash_searches[term]: query_val}, {"_id": 1})
+                    file_refs = [doc["_id"] for doc in file_docs]
+                if file_refs:
+                    if len(file_refs) > 1:
+                        query = {"$in": file_refs}
+                    else:
+                        query = file_refs[0]
+                    search_terms.extend([{f"{pfx}.{FILE_REF_KEY}": query} for pfx in NORMALIZED_FILE_FIELDS])
+            mongo_search_query = {"$or": search_terms}
+
+        # Allow to overwrite perform_search_filters for custom results
+        if not projection:
+            projection = perform_search_filters
+        if "target.file.sha256" in projection:
+            projection = dict(**projection)
+            projection[f"target.file.{FILE_REF_KEY}"] = 1
+        retval = list(mongo_find("analysis", mongo_search_query, projection, limit=search_limit))
+        for doc in retval:
+            target_file = doc.get("target", {}).get("file", {})
+            if FILE_REF_KEY in target_file and "sha256" not in target_file:
+                target_file["sha256"] = target_file.pop(FILE_REF_KEY)
+        return retval
+
     if es_as_db:
         _source_fields = list(perform_search_filters.keys())[:-1]
         if isinstance(search_term_map[term], str):
@@ -1278,23 +1256,58 @@ def parse_request_arguments(request, keyword="POST"):
 def get_hash_list(hashes):
     hashlist = []
     if "," in hashes:
-        hashlist = filter(None, hashes.replace(" ", "").strip().split(","))
+        hashlist = list(filter(None, hashes.replace(" ", "").strip().split(",")))
     else:
         hashlist = hashes.split()
+
+    for i in range(len(hashlist)):
+        if hashlist[i].startswith("http") and hashlist[i].endswith("/"):
+            hash = hashlist[i].split("/")[-2]
+            if len(hash) in (32, 40, 64):
+                hashlist[i] = hash
 
     return hashlist
 
 
-def download_from_vt(vtdl, details, opt_filename, settings):
-    for h in get_hash_list(vtdl):
-        folder = os.path.join(settings.VTDL_PATH, "cape-vt")
-        if not path_exists(folder):
-            path_mkdir(folder, exist_ok=True)
-        base_dir = tempfile.mkdtemp(prefix="vtdl", dir=folder)
+_bazaar_map = {
+    32: "md5_hash",
+    40: "sha1_hash",
+    64: "sha256_hash",
+}
+
+
+def _malwarebazaar_dl(hash):
+    sample = None
+    if len(hash) not in _bazaar_map:
+        return False
+
+    try:
+        data = requests.post("https://mb-api.abuse.ch/api/v1/", data={"query": "get_file", _bazaar_map[len(hash)]: hash})
+        if data.ok and b"file_not_found" not in data.content:
+            try:
+                with pyzipper.AESZipFile(io.BytesIO(data.content)) as zf:
+                    zf.setpassword(b"infected")
+                    sample = zf.read(zf.namelist()[0])
+            except pyzipper.zipfile.BadZipFile:
+                print(data.content)
+    except Exception as e:
+        logging.error(e, exc_info=True)
+
+    return sample
+
+
+def thirdpart_aux(samples, prefix, opt_filename, details, settings):
+    folder = os.path.join(settings.TEMP_PATH, "cape-external")
+    if not path_exists(folder):
+        path_mkdir(folder, exist_ok=True)
+    for h in get_hash_list(samples):
+        base_dir = tempfile.mkdtemp(prefix=prefix, dir=folder)
         if opt_filename:
             filename = f"{base_dir}/{opt_filename}"
         else:
             filename = f"{base_dir}/{sanitize_filename(h)}"
+        details["path"] = filename
+        details["fhash"] = h
         paths = db.sample_path_by_hash(h)
 
         # clean old content
@@ -1303,17 +1316,14 @@ def download_from_vt(vtdl, details, opt_filename, settings):
 
         if paths:
             details["content"] = get_file_content(paths)
-        if settings.VTDL_KEY:
-            details["headers"] = {"x-apikey": settings.VTDL_KEY}
-        elif details.get("apikey", False):
-            details["headers"] = {"x-apikey": details["apikey"]}
-        else:
-            details["errors"].append({"error": "Apikey not configured, neither passed as opt_apikey"})
-            return details
-        details["url"] = f"https://www.virustotal.com/api/v3/files/{h.lower()}/download"
-        details["fhash"] = h
-        details["path"] = filename
-        details["service"] = "VirusTotal"
+
+        if prefix == "vt":
+            details["url"] = f"https://www.virustotal.com/api/v3/files/{h.lower()}/download"
+        elif prefix == "bazaar":
+            content = _malwarebazaar_dl(h)
+            if content:
+                details["content"] = content
+
         if not details.get("content", False):
             status, task_ids_tmp = download_file(**details)
         else:
@@ -1325,6 +1335,28 @@ def download_from_vt(vtdl, details, opt_filename, settings):
             details["task_ids"] = task_ids_tmp
 
     return details
+
+
+def download_from_vt(samples, details, opt_filename, settings):
+    if settings.VTDL_KEY:
+        details["headers"] = {"x-apikey": settings.VTDL_KEY}
+    elif details.get("apikey", False):
+        details["headers"] = {"x-apikey": details["apikey"]}
+    else:
+        details["errors"].append({"error": "Apikey not configured, neither passed as opt_apikey"})
+        return details
+
+    details["service"] = "VirusTotal"
+    return thirdpart_aux(samples, "vt", opt_filename, details, settings)
+
+
+def download_from_bazaar(samples, details, opt_filename, settings):
+    if not HAVE_PYZIPPER:
+        print("Malware Bazaar download: Missed pyzipper dependency: pip3 install pyzipper -U")
+        return
+
+    details["service"] = "MalwareBazaar"
+    return thirdpart_aux(samples, "bazaar", opt_filename, details, settings)
 
 
 def process_new_task_files(request, samples, details, opt_filename, unique):
@@ -1414,7 +1446,6 @@ def submit_task(
     filename: str = "",
     server_url: str = "",
 ):
-
     """
     ToDo add url support in future
     """

@@ -10,7 +10,10 @@ class Chrome(Package):
 
     PATHS = [
         ("ProgramFiles", "Google", "Chrome", "Application", "chrome.exe"),
+        ("LOCALAPPDATA", "Chromium", "Application", "chrome.exe"),
     ]
+    summary = "Opens the URL in Google Chrome."
+    description = """Uses 'chrome.exe --disable-features=RendererCodeIntegrity "<url>"' to open the supplied url."""
 
     def start(self, url):
         chrome = self.get_path("Google")

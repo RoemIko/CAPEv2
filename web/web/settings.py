@@ -10,7 +10,7 @@ if os.geteuid() == 0 and os.getenv("CAPE_AS_ROOT", "0") != "1":
     sys.exit("Root is not allowed. You gonna break permission and other parts of CAPE. RTM!")
 
 # Cuckoo path.
-CUCKOO_PATH = os.path.join(Path.cwd(), "..")
+CUCKOO_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..", "..")
 sys.path.append(CUCKOO_PATH)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -34,10 +34,17 @@ aux_cfg = Config("auxiliary")
 web_cfg = Config("web")
 api_cfg = Config("api")
 
+REPROCESS_TASKS = web_cfg.general.reprocess_tasks
 # CSRF TRUSTED ORIGINS
-# For requests that include the Origin header, Django’s CSRF protection
+# For requests that include the Origin header, Django's CSRF protection
 # requires that header match the origin present in the Host header.
-CSRF_TRUSTED_ORIGINS = [f"http://{web_cfg.general.hostname}", f"https://{web_cfg.general.hostname}"]
+
+csfr_list = []
+if web_cfg.security.csrf_trusted_origins:
+    for host in web_cfg.security.csrf_trusted_origins.split(","):
+        csfr_list.extend([f"http://{host}", f"https://{host}"])
+
+CSRF_TRUSTED_ORIGINS = csfr_list
 # CSRF_COOKIE_SECURE = "True"
 
 # If reporting is enabled via the web GUI, then require one of these to be enabled
@@ -51,6 +58,7 @@ if web_cfg.web_reporting.get("enabled", True):
 
 WEB_AUTHENTICATION = web_cfg.web_auth.get("enabled", False)
 WEB_OAUTH = web_cfg.oauth
+REMOTE_SESSION = web_cfg.guacamole.enabled
 
 # Get connection options from reporting.conf.
 MONGO_HOST = cfg.mongodb.get("host", "127.0.0.1")
@@ -69,7 +77,6 @@ ELASTIC_USE_SSL = cfg.elasticsearchdb.get("use_ssl", None)
 ELASTIC_VERIFY_CERTS = cfg.elasticsearchdb.get("verify_certs", None)
 
 moloch_cfg = cfg.moloch
-vtdl_cfg = aux_cfg.virustotaldl
 zip_cfg = web_cfg.zipped_download
 
 URL_ANALYSIS = web_cfg.url_analysis.get("enabled", False)
@@ -82,9 +89,10 @@ MOLOCH_BASE = moloch_cfg.get("base")
 MOLOCH_NODE = moloch_cfg.get("node")
 MOLOCH_ENABLED = moloch_cfg.get("enabled", False)
 
-VTDL_ENABLED = vtdl_cfg.get("enabled", False)
-VTDL_KEY = vtdl_cfg.get("dlintelkey")
-VTDL_PATH = vtdl_cfg.get("dlpath")
+VTDL_ENABLED = web_cfg.download_services.get("virustotal", False)
+VTDL_KEY = web_cfg.download_services.get("vtkey", False)
+
+BAZAAR_ENABLED = web_cfg.download_services.get("malwarebazaar", False)
 
 TEMP_PATH = Config().cuckoo.get("tmppath", "/tmp")
 
@@ -173,7 +181,7 @@ TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
         "DIRS": [
-            "templates",
+            os.path.join(CUCKOO_PATH, "web", "templates"),
         ],
         "OPTIONS": {
             "debug": True,
@@ -210,8 +218,9 @@ MIDDLEWARE = [
     #'web.middleware.ExceptionMiddleware',
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     # 'django_otp.middleware.OTPMiddleware',
-    # in case you want custom auth, place logic in web/web/middleware.py
+    # in case you want custom auth, place logic in web/web/middleware/custom_auth.py
     # "web.middleware.CustomAuth",
+    "web.middleware.DBTransactionMiddleware",
 ]
 
 OTP_TOTP_ISSUER = "CAPE Sandbox"
@@ -499,3 +508,7 @@ try:
 except NameError:
     with suppress(ImportError):
         from .local_settings import *  # noqa: F403
+
+from lib.cuckoo.core.database import init_database
+
+init_database()

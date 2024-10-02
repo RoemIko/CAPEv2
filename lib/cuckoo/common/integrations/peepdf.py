@@ -15,9 +15,7 @@ try:
     HAVE_PEEPDF = True
 except ImportError:
     HAVE_PEEPDF = False
-    print(
-        "OPTIONAL! Missed dependency: pip3 install https://github.com/CAPESandbox/peepdf/archive/20eda78d7d77fc5b3b652ffc2d8a5b0af796e3dd.zip#egg=peepdf==0.4.2"
-    )
+    print("OPTIONAL! Missed dependency: poetry run pip install peepdf-3")
 
 log = logging.getLogger(__name__)
 
@@ -131,36 +129,34 @@ def peepdf_parse(filepath: str, pdfresult: Dict[str, Any]) -> Dict[str, Any]:
                         ret_data += tmp
                     obj_data["Data"] = ret_data
                     retobjects.append(obj_data)
-            elif details.type == "dictionary" and details.hasElement("/OpenAction"):
-                open_action = details.getElementByName("/OpenAction")
-                if open_action.hasElement("/JS"):
-                    js_elem = open_action.getElementByName("/JS")
+            elif details.type == "dictionary" and details.containsJScode:
+                js_elem = details.getElementByName("/JS")
+                if js_elem:
                     jsdata = None
-                    if js_elem:
-                        try:
-                            jslist, unescapedbytes, urlsfound, errors, ctxdummy = analyseJS(js_elem.value)
-                            jsdata = jslist[0]
-                        except Exception as e:
-                            log.error(e, exc_info=True)
-                            continue
-                        if errors or not jsdata:
-                            continue
+                    try:
+                        jslist, unescapedbytes, urlsfound, errors, ctxdummy = analyseJS(js_elem.value)
+                        jsdata = jslist[0]
+                    except Exception as e:
+                        log.error(e, exc_info=True)
+                        continue
+                    if errors or not jsdata:
+                        continue
 
-                        urlset.update(urlsfound)
-                        # The following loop is required to "JSONify" the strings returned from PyV8.
-                        # As PyV8 returns byte strings, we must parse out bytecode and
-                        # replace it with an escape '\'. We can't use encode("string_escape")
-                        # as this would mess up the new line representation which is used for
-                        # beautifying the javascript code for Django's web interface.
-                        ret_data = ""
-                        for char in jsdata:
-                            if ord(char) > 127:
-                                tmp = f"\\x{char.encode().hex()}"
-                            else:
-                                tmp = char
-                            ret_data += tmp
-                        obj_data["Data"] = ret_data
-                        retobjects.append(obj_data)
+                    urlset.update(urlsfound)
+                    # The following loop is required to "JSONify" the strings returned from PyV8.
+                    # As PyV8 returns byte strings, we must parse out bytecode and
+                    # replace it with an escape '\'. We can't use encode("string_escape")
+                    # as this would mess up the new line representation which is used for
+                    # beautifying the javascript code for Django's web interface.
+                    ret_data = ""
+                    for char in jsdata:
+                        if ord(char) > 127:
+                            tmp = f"\\x{char.encode().hex()}"
+                        else:
+                            tmp = char
+                        ret_data += tmp
+                    obj_data["Data"] = ret_data
+                    retobjects.append(obj_data)
             elif details.type == "dictionary" and details.hasElement("/A"):
                 # verify it to be a link type annotation
                 subtype_elem = details.getElementByName("/Subtype")
@@ -173,10 +169,11 @@ def peepdf_parse(filepath: str, pdfresult: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 a_elem = details.getElementByName("/A")
                 a_elem = _get_obj_val(pdf, i, a_elem)
-                if a_elem.type == "dictionary" and a_elem.hasElement("/URI"):
+                if a_elem and a_elem.type == "dictionary" and a_elem.hasElement("/URI"):
                     uri_elem = a_elem.getElementByName("/URI")
-                    uri_elem = _get_obj_val(pdf, i, uri_elem)
-                    annoturiset.add(f"{base_uri}{uri_elem.getValue()}")
+                    if uri_elem:
+                        uri_elem = _get_obj_val(pdf, i, uri_elem)
+                        annoturiset.add(f"{base_uri}{uri_elem.getValue()}")
         pdfresult["JSStreams"] = retobjects
     if "creator" in metadata:
         pdfresult["Info"]["Creator"] = convert_to_printable(_clean_string(metadata["creator"]))

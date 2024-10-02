@@ -2,7 +2,6 @@ import glob
 import logging
 import os
 import subprocess
-from threading import Thread
 
 from lib.common.abstracts import Auxiliary
 from lib.common.results import NetlogFile
@@ -11,17 +10,25 @@ from lib.core.config import Config
 log = logging.getLogger(__name__)
 
 
-class Pre_script(Thread, Auxiliary):
+class Pre_script(Auxiliary):
     def __init__(self, options=None, config=None):
         if options is None:
             options = {}
-        Thread.__init__(self)
         Auxiliary.__init__(self, options, config)
         self.config = Config(cfg="analysis.conf")
         self.enabled = self.config
-        # Go to the temp folder to look for pre_script.py
         tmp_folder = os.environ["TEMP"]
-        matched_files = glob.glob(os.path.join(tmp_folder, "pre_script.*"))
+        try:
+            self.prescript_detection = bool(self.options.get("prescript_detection", False))
+        except ValueError:
+            log.error("Invalid option for prescript_detection specified, defaulting to False")
+            self.prescript_detection = False
+        if self.prescript_detection:
+            prescript_path = os.path.join(".", "prescripts")
+            matched_files = [os.path.join(prescript_path, "prescript_detection.py")]
+        else:
+            # Go to the temp folder to look for pre_script.py
+            matched_files = glob.glob(os.path.join(tmp_folder, "pre_script.*"))
 
         # Check if the file exists and if the pre_script is enabled
         if matched_files and self.enabled.pre_script:

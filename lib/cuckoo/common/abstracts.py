@@ -4,6 +4,7 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import datetime
+import io
 import logging
 import os
 import socket
@@ -11,6 +12,7 @@ import threading
 import time
 import timeit
 import xml.etree.ElementTree as ET
+from builtins import NotImplementedError
 from pathlib import Path
 from typing import Dict, List
 
@@ -18,10 +20,12 @@ try:
     import dns.resolver
 except ImportError:
     print("Missed dependency -> pip3 install dnspython")
+import PIL
 import requests
 
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
+from lib.cuckoo.common.dictionary import Dictionary
 from lib.cuckoo.common.exceptions import (
     CuckooCriticalError,
     CuckooDependencyError,
@@ -30,11 +34,10 @@ from lib.cuckoo.common.exceptions import (
     CuckooReportError,
 )
 from lib.cuckoo.common.integrations.mitre import mitre_load
-from lib.cuckoo.common.objects import Dictionary
-from lib.cuckoo.common.path_utils import path_exists
+from lib.cuckoo.common.path_utils import path_exists, path_mkdir
 from lib.cuckoo.common.url_validate import url as url_validator
 from lib.cuckoo.common.utils import create_folder, get_memdump_path, load_categories
-from lib.cuckoo.core.database import Database
+from lib.cuckoo.core.database import Database, Machine, _Database
 
 try:
     import re2 as re
@@ -103,42 +106,44 @@ class Machinery:
     # Default label used in machinery configuration file to supply virtual
     # machine name/label/vmx path. Override it if you dubbed it in another
     # way.
-    LABEL = "label"
+    LABEL: str = "label"
+
+    # This must be defined in sub-classes.
+    module_name: str
 
     def __init__(self):
-        self.module_name = ""
         self.options = None
         # Database pointer.
-        self.db = Database()
-        # Machine table is cleaned to be filled from configuration file
-        # at each start.
-        self.db.clean_machines()
+        self.db: _Database = Database()
+        self.set_options(self.read_config())
 
-    def set_options(self, options: dict):
+    def read_config(self) -> None:
+        return Config(self.module_name)
+
+    def set_options(self, options: dict) -> None:
         """Set machine manager options.
         @param options: machine manager options dict.
         """
         self.options = options
+        mmanager_opts = self.options.get(self.module_name)
+        if not isinstance(mmanager_opts["machines"], list):
+            mmanager_opts["machines"] = str(mmanager_opts["machines"]).strip().split(",")
 
-    def initialize(self, module_name):
-        """Read, load, and verify machines configuration.
-        @param module_name: module name.
-        """
+    def initialize(self) -> None:
+        """Read, load, and verify machines configuration."""
+        # Machine table is cleaned to be filled from configuration file
+        # at each start.
+        self.db.clean_machines()
+
         # Load.
-        self._initialize(module_name)
+        self._initialize()
 
         # Run initialization checks.
         self._initialize_check()
 
-    def _initialize(self, module_name):
-        """Read configuration.
-        @param module_name: module name.
-        """
-        self.module_name = module_name
-        mmanager_opts = self.options.get(module_name)
-        if not isinstance(mmanager_opts["machines"], list):
-            mmanager_opts["machines"] = str(mmanager_opts["machines"]).strip().split(",")
-
+    def _initialize(self) -> None:
+        """Read configuration."""
+        mmanager_opts = self.options.get(self.module_name)
         for machine_id in mmanager_opts["machines"]:
             try:
                 machine_opts = self.options.get(machine_id.strip())
@@ -194,19 +199,34 @@ class Machinery:
                 log.warning("Configuration details about machine %s are missing: %s", machine_id.strip(), e)
                 continue
 
-    def _initialize_check(self):
-        """Runs checks against virtualization software when a machine manager
-        is initialized.
-        @note: in machine manager modules you may override or superclass
-               his method.
-        @raise CuckooMachineError: if a misconfiguration or a unkown vm state
-                                   is found.
+    def _initialize_check(self) -> None:
+        """Runs checks against virtualization software when a machine manager is initialized.
+        @note: in machine manager modules you may override or superclass his method.
+        @raise CuckooMachineError: if a misconfiguration or a unkown vm state is found.
         """
         try:
             configured_vms = self._list()
         except NotImplementedError:
             return
 
+        self.shutdown_running_machines(configured_vms)
+        self.check_screenshot_support()
+
+        if not cfg.timeouts.vm_state:
+            raise CuckooCriticalError("Virtual machine state change timeout setting not found, please add it to the config file")
+
+    def check_screenshot_support(self) -> None:
+        # If machinery_screenshots are enabled, check the machinery supports it.
+        if not cfg.cuckoo.machinery_screenshots:
+            return
+
+        # inspect function members available on the machinery class
+        func = getattr(self.__class__, "screenshot")
+        if func == Machinery.screenshot:
+            msg = f"machinery {self.module_name} does not support machinery screenshots"
+            raise CuckooCriticalError(msg)
+
+    def shutdown_running_machines(self, configured_vms: List[str]) -> None:
         for machine in self.machines():
             # If this machine is already in the "correct" state, then we
             # go on to the next machine.
@@ -221,16 +241,13 @@ class Machinery:
                 msg = f"Please update your configuration. Unable to shut '{machine.label}' down or find the machine in its proper state: {e}"
                 raise CuckooCriticalError(msg) from e
 
-        if not cfg.timeouts.vm_state:
-            raise CuckooCriticalError("Virtual machine state change timeout setting not found, please add it to the config file")
-
     def machines(self):
         """List virtual machines.
         @return: virtual machines list
         """
         return self.db.list_machines(include_reserved=True)
 
-    def availables(self, label=None, platform=None, tags=None, arch=None, include_reserved=False, os_version=[]):
+    def availables(self, label=None, platform=None, tags=None, arch=None, include_reserved=False, os_version=None):
         """How many (relevant) machines are free.
         @param label: machine ID.
         @param platform: machine platform.
@@ -242,25 +259,15 @@ class Machinery:
             label=label, platform=platform, tags=tags, arch=arch, include_reserved=include_reserved, os_version=os_version
         )
 
-    def acquire(self, machine_id=None, platform=None, tags=None, arch=None, os_version=[]):
-        """Acquire a machine to start analysis.
-        @param machine_id: machine ID.
-        @param platform: machine platform.
-        @param tags: machine tags
-        @param arch: machine arch
-        @return: machine or None.
-        """
-        if machine_id:
-            return self.db.lock_machine(label=machine_id)
-        elif platform:
-            return self.db.lock_machine(platform=platform, tags=tags, arch=arch, os_version=os_version)
-        return self.db.lock_machine(tags=tags, arch=arch, os_version=os_version)
+    def scale_pool(self, machine: Machine) -> None:
+        """This can be overridden in sub-classes to scale the pool of machines once one has been acquired."""
+        return
 
-    def release(self, label=None):
+    def release(self, machine: Machine) -> Machine:
         """Release a machine.
         @param label: machine name.
         """
-        self.db.unlock_machine(label)
+        return self.db.unlock_machine(machine)
 
     def running(self):
         """Returns running virtual machines.
@@ -268,13 +275,25 @@ class Machinery:
         """
         return self.db.list_machines(locked=True)
 
+    def running_count(self):
+        return self.db.count_machines_running()
+
+    def screenshot(self, label, path):
+        """Screenshot a running virtual machine.
+        @param label: machine name
+        @param path: where to store the screenshot
+        @raise NotImplementedError
+        """
+        raise NotImplementedError
+
     def shutdown(self):
         """Shutdown the machine manager. Kills all alive machines.
         @raise CuckooMachineError: if unable to stop machine.
         """
-        if len(self.running()) > 0:
-            log.info("Still %d guests still alive, shutting down...", len(self.running()))
-            for machine in self.running():
+        running = self.running()
+        if len(running) > 0:
+            log.info("Still %d guests still alive, shutting down...", len(running))
+            for machine in running:
                 try:
                     self.stop(machine.label)
                 except CuckooMachineError as e:
@@ -359,21 +378,12 @@ class LibVirtMachinery(Machinery):
     ABORTED = "abort"
 
     def __init__(self):
-
-        if not categories_need_VM:
-            return
-
         if not HAVE_LIBVIRT:
-            raise CuckooDependencyError("Unable to import libvirt")
+            raise CuckooDependencyError(
+                "Unable to import libvirt. Ensure that you properly installed it by running: cd /opt/CAPEv2/ ; sudo -u cape poetry run extra/libvirt_installer.sh"
+            )
 
-        super(LibVirtMachinery, self).__init__()
-
-    def initialize(self, module):
-        """Initialize machine manager module. Override default to set proper
-        connection string.
-        @param module:  machine manager module
-        """
-        super(LibVirtMachinery, self).initialize(module)
+        super().__init__()
 
     def _initialize_check(self):
         """Runs all checks when a machine manager is initialized.
@@ -388,7 +398,7 @@ class LibVirtMachinery(Machinery):
 
         # Base checks. Also attempts to shutdown any machines which are
         # currently still active.
-        super(LibVirtMachinery, self)._initialize_check()
+        super()._initialize_check()
 
     def start(self, label):
         """Starts a virtual machine.
@@ -397,13 +407,16 @@ class LibVirtMachinery(Machinery):
         """
         log.debug("Starting machine %s", label)
 
+        vm_info = self.db.view_machine_by_label(label)
+        if vm_info is None:
+            msg = f"Unable to find machine with label {label} in database."
+            raise CuckooMachineError(msg)
+
         if self._status(label) != self.POWEROFF:
             msg = f"Trying to start a virtual machine that has not been turned off {label}"
             raise CuckooMachineError(msg)
 
         conn = self._connect(label)
-
-        vm_info = self.db.view_machine_by_label(label)
 
         snapshot_list = self.vms[label].snapshotListNames(flags=0)
 
@@ -462,10 +475,46 @@ class LibVirtMachinery(Machinery):
 
     def shutdown(self):
         """Override shutdown to free libvirt handlers - they print errors."""
-        super(LibVirtMachinery, self).shutdown()
+        for machine in self.machines():
+            # If the machine is already shutdown, move on
+            if self._status(machine.label) in (self.POWEROFF, self.ABORTED):
+                continue
+            try:
+                log.info("Shutting down machine '%s'", machine.label)
+                self.stop(machine.label)
+            except CuckooMachineError as e:
+                log.warning("Unable to shutdown machine %s, please check manually. Error: %s", machine.label, e)
 
         # Free handlers.
         self.vms = None
+
+    def screenshot(self, label, path):
+        """Screenshot a running virtual machine.
+        @param label: machine name
+        @param path: where to store the screenshot
+        """
+        conn = self._connect()
+        try:
+            vm = conn.lookupByName(label)
+        except libvirt.libvirtError as e:
+            raise CuckooMachineError(f"Error screenshotting virtual machine {label}: {e}") from e
+        stream0, screen = conn.newStream(), 0
+        # ignore the mime type returned by the call to screenshot()
+        _ = vm.screenshot(stream0, screen)
+
+        buffer = io.BytesIO()
+
+        def stream_handler(_, data, buffer):
+            buffer.write(data)
+
+        folder_name, _ = path.rsplit("/", 1)
+        if not path_exists(folder_name):
+            path_mkdir(folder_name, parent=True, exist_ok=True)
+
+        stream0.recvAll(stream_handler, buffer)
+        stream0.finish()
+        streamed_img = PIL.Image.open(buffer)
+        streamed_img.convert(mode="RGB").save(path)
 
     def dump_memory(self, label, path):
         """Takes a memory dump.
@@ -660,6 +709,7 @@ class Processing:
         @param analysis_path: analysis folder path.
         """
         self.analysis_path = analysis_path
+        self.aux_path = os.path.join(self.analysis_path, "aux")
         self.log_path = os.path.join(self.analysis_path, "analysis.log")
         self.package_files = os.path.join(self.analysis_path, "package_files")
         self.file_path = os.path.realpath(os.path.join(self.analysis_path, "binary"))
@@ -775,6 +825,7 @@ class Signature:
         # self.memory_path = os.path.join(self.analysis_path, "memory.dmp")
         self.memory_path = get_memdump_path(analysis_path.rsplit("/", 1)[-1])
         self.self_extracted = os.path.join(self.analysis_path, "selfextracted")
+        self.files_metadata = os.path.join(self.analysis_path, "files.json")
 
         try:
             create_folder(folder=self.reports_path)
@@ -820,8 +871,9 @@ class Signature:
                                 path = block["path"] if block.get("path", False) else ""
                                 yield keyword, path, yara_block, block
 
-                        if keyword == "procmemory":
-                            for pe in block.get("extracted_pe", []) or []:
+                    if keyword == "procmemory":
+                        for pe in block.get("extracted_pe", []) or []:
+                            for sub_keyword in ("cape_yara", "yara"):
                                 for yara_block in pe.get(sub_keyword, []) or []:
                                     if re.findall(name, yara_block["name"], re.I):
                                         yield "extracted_pe", pe["path"], yara_block, block
@@ -1562,6 +1614,7 @@ class Signature:
         return dict(
             name=self.name,
             description=self.description,
+            categories=self.categories,
             severity=self.severity,
             weight=self.weight,
             confidence=self.confidence,

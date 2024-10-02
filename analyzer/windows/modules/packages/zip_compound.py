@@ -8,7 +8,18 @@ import shutil
 from typing import Tuple
 
 from lib.common.abstracts import Package
+from lib.common.constants import (
+    DLL_OPTIONS,
+    OPT_APPDATA,
+    OPT_ARGUMENTS,
+    OPT_CURDIR,
+    OPT_DLLLOADER,
+    OPT_FILE,
+    OPT_FUNCTION,
+    OPT_PASSWORD,
+)
 from lib.common.exceptions import CuckooPackageError
+from lib.common.zip_utils import extract_zip
 from lib.core.compound import create_custom_folders, extract_json_data
 
 log = logging.getLogger(__name__)
@@ -22,32 +33,37 @@ class ZipCompound(Package):
         ("SystemRoot", "system32", "wscript.exe"),
         ("SystemRoot", "system32", "rundll32.exe"),
         ("SystemRoot", "sysnative", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        ("ProgramFiles", "7-Zip", "7z.exe"),
         ("SystemRoot", "system32", "xpsrchvw.exe"),
+        ("ProgramFiles", "Microsoft Office", "WINWORD.EXE"),
+        ("ProgramFiles", "Microsoft Office", "Office*", "WINWORD.EXE"),
+        ("ProgramFiles", "Microsoft Office*", "root", "Office*", "WINWORD.EXE"),
+        ("ProgramFiles", "Microsoft Office", "WORDVIEW.EXE"),
+        ("ProgramFiles", "Microsoft Office", "EXCEL.EXE"),
+        ("ProgramFiles", "Microsoft Office", "Office*", "EXCEL.EXE"),
+        ("ProgramFiles", "Microsoft Office*", "root", "Office*", "EXCEL.EXE"),
+        ("ProgramFiles", "Microsoft", "Edge", "Application", "msedge.exe"),
     ]
+    summary = "Unpacks a .zip archive with the given password and execute the contents appropriately."
+    description = f"""Extracts the contents of a .zip file.
+    Supply '{OPT_PASSWORD}' if the .zip file is encrypted (defaults to blank).
+    *NB*: Either '{OPT_FILE}' option must be set, or a '__configuration.json' file must be present in the zip file.
+    Sample json file:
 
-    @staticmethod
-    def is_valid_extension(filename: str) -> bool:
-        """
-        Checks given filename for extensions that the zip_compound package can run.
-        @param filename: name or full path of the file.
-        @return: Boolean whether extension is recognised.
-        """
+        {{
+            "path_to_extract": {{
+                "a.exe": "%USERPROFILE%\\Desktop\\a\\b\\c",
+                "folder_b": "%appdata%"
+            }},
+            "target_file":"a.exe"
+        }}
 
-        valid = (
-            ".exe",
-            ".dll",
-            ".scr",
-            ".msi",
-            ".bat",
-            ".lnk",
-            ".js",
-            ".jse",
-            ".vbs",
-            ".vbe",
-            ".wsf",
-            ".ps1",
-        )
-        return filename.endswith(valid)
+    If the '{OPT_CURDIR}' option is specified, use that as the current directory.
+    Else, if the '{OPT_APPDATA}' option is specified, run the executable from the APPDATA directory.
+    The execution method is chosen based on the filename extension.
+    If executing a .dll file, then options '{OPT_FUNCTION}', '{OPT_ARGUMENTS}' and '{OPT_DLLLOADER}' will take effect.
+    """
+    option_names = sorted(set(DLL_OPTIONS + (OPT_CURDIR, OPT_FILE, OPT_PASSWORD, OPT_APPDATA)))
 
     def process_unzipped_contents(self, unzipped_directory: str, json_filename: str) -> Tuple[str, str]:
         """Checks JSON to move the various files to."""
@@ -57,13 +73,11 @@ class ZipCompound(Package):
         target_file = raw_json.get("target_file", "")
 
         # Enforce the requirement of having a specified file. No guessing.
-        target_file = target_file or self.options.get("file")
+        target_file = target_file or self.options.get(OPT_FILE)
         if not target_file:
             raise CuckooPackageError("File must be specified in the JSON or the web submission UI!")
-        elif not self.is_valid_extension(target_file):
-            raise CuckooPackageError("Invalid, unsupported or no extension recognised by zip_compound package")
 
-        # In case the "file" submittion option is relative, we split here
+        # In case the "file" submission option is relative, we split here
         target_srcdir, target_name = os.path.split(target_file)
 
         # Note for 32bit samples: Even if JSON configutation specifies "System32",
@@ -96,8 +110,8 @@ class ZipCompound(Package):
 
                 if target_file.lower() == f.lower():
                     fin_target_path = newpath
-                    self.options["curdir"] = dst_fld
-                    log.debug("New curdir value: %s", self.options["curdir"])
+                    self.options[OPT_CURDIR] = dst_fld
+                    log.debug("New curdir value: %s", self.options[OPT_CURDIR])
 
         # Only runs if a relative path is given for target file
         # Errors out if the file's containing folder is shifted
@@ -113,65 +127,26 @@ class ZipCompound(Package):
         log.info("Final target path: %s", fin_target_path)
         return target_name, fin_target_path
 
-    def prepare_zip_compound(self, path: str, json_filename: str) -> Tuple[str, str]:
+    def prepare_zip_compound(self, path: str, json_filename: str) -> Tuple[str, str, str]:
         """Pre-process the submitted zip file"""
-        password = self.options.get("password")
+        password = self.options.get(OPT_PASSWORD)
         if password is None:
             log.info("No archive password provided")
             password = b""
 
-        if "curdir" in self.options:
-            root = self.options["curdir"]
-        elif "appdata" in self.options:
+        if OPT_CURDIR in self.options:
+            root = self.options[OPT_CURDIR]
+        elif OPT_APPDATA in self.options:
             root = os.environ["APPDATA"]
         else:
             root = os.environ["TEMP"]
         create_custom_folders(root)
 
-        # Have to shift this import here because of how analyzer's Package.__subclasses__ work
-        from modules.packages.zip import Zip
+        extract_zip(path, root, password, 0)
 
-        z = Zip()
-        z.extract_zip(path, root, password, 0)
-
-        return self.process_unzipped_contents(root, json_filename)
+        file_name, file_path = self.process_unzipped_contents(root, json_filename)
+        return root, file_name, file_path
 
     def start(self, path, json_config="__configuration.json"):
-        file_name, file_path = self.prepare_zip_compound(path, json_config)
-        file_name = file_name.lower()
-
-        if file_name.endswith(".lnk"):
-            cmd_path = self.get_path("cmd.exe")
-            cmd_args = f"/c start /wait '' '{file_path}'"
-            return self.execute(cmd_path, cmd_args, file_path)
-        elif file_name.endswith(".msi"):
-            msi_path = self.get_path("msiexec.exe")
-            msi_args = f"/I '{file_path}'"
-            return self.execute(msi_path, msi_args, file_path)
-        elif file_name.endswith((".js", ".jse", ".vbs", ".vbe", ".wsf")):
-            wscript = self.get_path_app_in_path("wscript.exe")
-            wscript_args = f"'{file_path}'"
-            return self.execute(wscript, wscript_args, file_path)
-        elif file_name.endswith(".dll"):
-            rundll32 = self.get_path_app_in_path("rundll32.exe")
-            function = self.options.get("function", "#1")
-            arguments = self.options.get("arguments")
-            dllloader = self.options.get("dllloader")
-            dll_args = f"'{file_path}',{function}"
-            if arguments:
-                dll_args += f" {arguments}"
-            if dllloader:
-                newname = os.path.join(os.path.dirname(rundll32), dllloader)
-                shutil.copy(rundll32, newname)
-                rundll32 = newname
-            return self.execute(rundll32, dll_args, file_path)
-        elif file_name.endswith(".ps1"):
-            powershell = self.get_path_app_in_path("powershell.exe")
-            args = f"-NoProfile -ExecutionPolicy bypass -File '{path}'"
-            return self.execute(powershell, args, file_path)
-        else:
-            if "." not in os.path.basename(file_path):
-                new_path = f"{file_path}.exe"
-                os.rename(file_path, new_path)
-                file_path = new_path
-            return self.execute(file_path, self.options.get("arguments"), file_path)
+        root, file_name, file_path = self.prepare_zip_compound(path, json_config)
+        return self.execute_interesting_file(root, file_name, file_path)

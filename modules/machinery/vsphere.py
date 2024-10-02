@@ -21,7 +21,7 @@ try:
     HAVE_PYVMOMI = True
 except ImportError:
     HAVE_PYVMOMI = False
-    sys.exit("Missed library: pip3 install pyvmomi")
+    sys.exit("Missed library: poetry run pip install pyvmomi")
 
 log = logging.getLogger(__name__)
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -30,6 +30,8 @@ cfg = Config()
 
 class vSphere(Machinery):
     """vSphere/ESXi machinery class based on pyVmomi Python SDK."""
+
+    module_name = "vsphere"
 
     # VM states
     RUNNING = "poweredOn"
@@ -41,13 +43,13 @@ class vSphere(Machinery):
         if not HAVE_PYVMOMI:
             raise CuckooDependencyError("Couldn't import pyVmomi. Please install using 'pip3 install --upgrade pyvmomi'")
 
-        super(vSphere, self).__init__()
+        super().__init__()
 
-    def _initialize(self, module_name):
+    def _initialize(self):
         """Read configuration.
         @param module_name: module name.
         """
-        super(vSphere, self)._initialize(module_name)
+        super(vSphere, self)._initialize()
 
         # Initialize random number generator
         random.seed()
