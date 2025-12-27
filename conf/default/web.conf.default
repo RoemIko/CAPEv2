@@ -7,6 +7,8 @@ enabled = no
 captcha = no
 2fa = no
 # To enable Oauth check https://django-allauth.readthedocs.io and web/web/settings.py.
+# Allow only SSO for users with specific domain. Can be allow to all if empty.
+social_auth_email_domain = example.com
 
 [registration]
 enabled = no
@@ -44,6 +46,8 @@ anon_viewable = no
 existent_tasks = no
 top_detections = yes
 top_asn = yes
+# Enable checking for samples in MongoDB before fetching from external sources. Disable to reduce MongoDB load when the database is large.
+check_sample_in_mongodb = no
 # hostname of the cape instance
 hostname = 127.0.0.1
 ;hostname = www.capesandbox.com
@@ -59,6 +63,10 @@ reports_dl_allowed_to_all = yes
 expose_process_log = no
 # Show button to reprocess the task
 reprocess_tasks = no
+# Allows you to define URL splitter, "," is default
+url_splitter = ,
+# Limit number of files extracted from archive in demux.py
+demux_files_limit = 10
 
 # ratelimit for anon users
 [ratelimit]
@@ -78,8 +86,10 @@ enabled = no
 
 #enable linux fields on webgui
 [linux]
-#For advanced users only, can be buggy, linux analysis is work in progress for fun
+# For advanced users only, can be buggy, linux analysis is work in progress for fun
 enabled = no
+# independent of enabled or not. To not show linux options, but process statically those files
+static_only = no
 
 [malscore]
 enabled = no
@@ -88,7 +98,7 @@ enabled = no
 enabled = no
 
 [vtupload]
-# Don't forget to set VT key in aux.conf under virustotaldl
+# Don't forget to set apikey in integrations.conf under virustotal
 enabled = no
 
 #No means delete is disabled on webgui
@@ -140,9 +150,6 @@ enabled = no
 [display_office_martians]
 enabled = no
 
-[display_shrike]
-enabled = no
-
 [display_task_tags]
 # displays custom tags, if set during sample submission
 enabled = no
@@ -192,6 +199,7 @@ guest_width = 1280
 guest_height = 1024
 # rdp settings
 guest_rdp_port = 3389
+ignore_rdp_cert = false
 
 [packages]
 # VM tags may be used to specify on which guest machines a sample should be run
@@ -213,15 +221,8 @@ csrf_trusted_origins =
 # Example: packages = chrome,chromium,firefox
 packages =
 
-# external download services
-[download_services]
-# adds an option in the web interface to upload samples via VirusTotal/MalwareBazaar
-# downloads for a comma-separated list of MD5/SHA1/SHA256 hashes
-virustotal = no
-# note that unlike the VirusTotal processing module, the key required
-# here is a Intelligence API key, not a Public API key
-vtkey =
-malwarebazaar = no
-
 [yara_detail]
+enabled = no
+
+[pcap_ng]
 enabled = no

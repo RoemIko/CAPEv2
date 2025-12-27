@@ -38,7 +38,15 @@ from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.utils import get_options
-from lib.cuckoo.core.database import TASK_COMPLETED, TASK_FAILED_PROCESSING, TASK_REPORTED, Database, Task, init_database
+from lib.cuckoo.core.database import (
+    TASK_COMPLETED,
+    TASK_FAILED_PROCESSING,
+    TASK_FAILED_REPORTING,
+    TASK_REPORTED,
+    Database,
+    Task,
+    init_database,
+)
 from lib.cuckoo.core.plugins import RunProcessing, RunReporting, RunSignatures
 from lib.cuckoo.core.startup import ConsoleHandler, check_linux_dist, init_modules
 
@@ -68,6 +76,15 @@ original_proctitle = getproctitle()
 
 # https://stackoverflow.com/questions/41105733/limit-ram-usage-to-python-program
 def memory_limit(percentage: float = 0.8):
+    """
+    Sets a memory limit for the current process on Linux systems.
+
+    Args:
+        percentage (float): Percentage of the total system memory that is allowed to be used. Defaults to 0.8 (80%).
+
+    Returns:
+        None
+    """
     if platform.system() != "Linux":
         print("Only works on linux!")
         return
@@ -137,9 +154,10 @@ def process(
         else:
             reprocess = report
 
-        RunReporting(task=task.to_dict(), results=results, reprocess=reprocess).run()
+        error_count = RunReporting(task=task.to_dict(), results=results, reprocess=reprocess).run()
+        status = TASK_REPORTED if error_count == 0 else TASK_FAILED_REPORTING
         with db.session.begin():
-            db.set_status(task_id, TASK_REPORTED)
+            db.set_status(task_id, status)
 
         if auto:
             # Is ok to delete original file, but we need to lookup on delete_bin_copy if no more pendings tasks
@@ -162,6 +180,12 @@ def process(
 
     log.removeHandler(per_analysis_handler)
 
+    # Remove the SQLAlchemy session to ensure the next task pulls objects from
+    # the database, instead of relying on a potentially outdated object cache.
+    # Stale data can prevent SQLAlchemy from querying the database or issuing
+    # statements, resulting in unexpected errors and inconsistencies.
+    db.session.remove()
+
 
 def init_worker():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -170,6 +194,16 @@ def init_worker():
 
 
 def get_formatter_fmt(task_id=None, main_task_id=None):
+    """
+    Generates a logging format string with optional task identifiers.
+
+    Args:
+        task_id (int, optional): The ID of the task. Defaults to None.
+        main_task_id (int, optional): The ID of the main task. Defaults to None.
+
+    Returns:
+        str: A formatted string for logging that includes the task information if provided.
+    """
     task_info = f"[Task {task_id}" if task_id is not None else ""
     if main_task_id:
         task_info += f" ({main_task_id})"
@@ -185,7 +219,32 @@ def set_formatter_fmt(task_id=None, main_task_id=None):
     FORMATTER._style._fmt = get_formatter_fmt(task_id, main_task_id)
 
 
+class ForceClosingTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    def doRollover(self):
+        """
+        Override doRollover to force close the old handler before creating a new one.
+        """
+        if self.stream:
+            self.stream.flush()
+            self.stream.close()
+        super().doRollover()
+
+
 def init_logging(debug=False):
+    """
+    Initializes logging for the application.
+
+    This function sets up logging handlers for console output, syslog, and file output.
+    It also configures log rotation if enabled in the configuration.
+
+    Args:
+        debug (bool): If True, sets the logging level to DEBUG. Otherwise, sets it to INFO.
+
+    Returns:
+        tuple: A tuple containing the console handler, file handler, and syslog handler (if configured).
+
+    Raises:
+        PermissionError: If there is an issue creating or accessing the log file, typically due to incorrect user permissions.
     # Pyattck creates root logger which we don't want. So we must use this dirty hack to remove it
     # If basicConfig was already called by something and had a StreamHandler added,
     # replace it with a ConsoleHandler.
@@ -193,7 +252,7 @@ def init_logging(debug=False):
         if isinstance(h, logging.StreamHandler) and h.stream == sys.stderr:
             log.removeHandler(h)
             h.close()
-
+    """
     """
     Handlers:
         - ch - console handler
@@ -219,7 +278,7 @@ def init_logging(debug=False):
         path = os.path.join(CUCKOO_ROOT, "log", "process.log")
         if logconf.log_rotation.enabled:
             days = logconf.log_rotation.backup_count or 7
-            fh = logging.handlers.TimedRotatingFileHandler(path, when="midnight", backupCount=int(days))
+            fh = ForceClosingTimedRotatingFileHandler(path, when="midnight", backupCount=int(days))
         else:
             fh = logging.handlers.WatchedFileHandler(path)
 
@@ -271,20 +330,32 @@ def init_per_analysis_logging(tid=0, debug=False):
 
 
 def processing_finished(future):
+    """
+    Callback function to handle the completion of a processing task.
+
+    This function is called when a future task is completed. It retrieves the task ID from the
+    pending_future_map, logs the result, and updates the task status in the database. If an
+    exception occurs during processing, it logs the error and sets the task status to failed.
+
+    Args:
+        future (concurrent.futures.Future): The future object representing the asynchronous task.
+
+    Raises:
+        TimeoutError: If the processing task times out.
+        pebble.ProcessExpired: If the processing task expires.
+        Exception: For any other exceptions that occur during processing.
+    """
     task_id = pending_future_map.get(future)
     with db.session.begin():
         try:
             _ = future.result()
             log.info("Reports generation completed for Task #%d", task_id)
         except TimeoutError as error:
-            log.error("[%d] Processing Timeout %s. Function: %s", task_id, error, error.args[1])
-            Database().set_status(task_id, TASK_FAILED_PROCESSING)
-        except pebble.ProcessExpired as error:
-            log.error("[%d] Exception when processing task: %s", task_id, error, exc_info=True)
-            Database().set_status(task_id, TASK_FAILED_PROCESSING)
-        except Exception as error:
-            log.error("[%d] Exception when processing task: %s", task_id, error, exc_info=True)
-            Database().set_status(task_id, TASK_FAILED_PROCESSING)
+            log.error("[%d] Processing timeout: %s. Function: %s", task_id, error, error.args[1])
+            db.set_status(task_id, TASK_FAILED_PROCESSING)
+        except (pebble.ProcessExpired, Exception) as error:
+            log.exception("[%d] Exception when processing task: %s", task_id, error)
+            db.set_status(task_id, TASK_FAILED_PROCESSING)
 
     pending_future_map.pop(future)
     pending_task_id_map.pop(task_id)
@@ -293,14 +364,33 @@ def processing_finished(future):
 
 
 def autoprocess(
-    parallel=1, failed_processing=False, maxtasksperchild=7, memory_debugging=False, processing_timeout=300, debug: bool = False
+    parallel=1, failed_processing=False, maxtasksperchild=7, memory_debugging=False, processing_timeout=300, debug: bool = False, disable_memory_limit: bool = False
 ):
+    """
+    Automatically processes analysis data using a process pool.
+
+    Args:
+        parallel (int): Number of parallel processes to use. Default is 1.
+        failed_processing (bool): Whether to process failed tasks. Default is False.
+        maxtasksperchild (int): Maximum number of tasks per child process. Default is 7.
+        memory_debugging (bool): Whether to enable memory debugging. Default is False.
+        processing_timeout (int): Timeout for processing each task in seconds. Default is 300.
+        debug (bool): Whether to enable debug mode. Default is False.
+
+    Raises:
+        KeyboardInterrupt: If the process is interrupted by the user.
+        MemoryError: If there is not enough free RAM to run processing.
+        OSError: If an OS-related error occurs.
+        Exception: If any other exception occurs during processing.
+
+    """
     maxcount = cfg.cuckoo.max_analysis_count
     count = 0
     # pool = multiprocessing.Pool(parallel, init_worker)
     pool = False
     try:
-        memory_limit()
+        if not disable_memory_limit:
+            memory_limit()
         log.info("Processing analysis data")
         with pebble.ProcessPool(max_workers=parallel, max_tasks=maxtasksperchild, initializer=init_worker) as pool:
             # CAUTION - big ugly loop ahead.
@@ -308,7 +398,7 @@ def autoprocess(
                 # If not enough free disk space is available, then we print an
                 # error message and wait another round (this check is ignored
                 # when the freespace configuration variable is set to zero).
-                if cfg.cuckoo.freespace:
+                if cfg.cuckoo.freespace_processing:
                     # Resolve the full base path to the analysis folder, just in
                     # case somebody decides to make a symbolic link out of it.
                     dir_path = os.path.join(CUCKOO_ROOT, "storage", "analyses")
@@ -382,6 +472,18 @@ def autoprocess(
 
 
 def _load_report(task_id: int):
+    """
+    Load the analysis report for a given task ID from the configured database.
+
+    This function attempts to load the analysis report from MongoDB if it is enabled.
+    If MongoDB is not enabled, it tries to load the report from Elasticsearch if it is enabled and not in search-only mode.
+
+    Args:
+        task_id (int): The ID of the task for which to load the analysis report.
+
+    Returns:
+        dict or bool: The analysis report as a dictionary if found, otherwise False.
+    """
     if repconf.mongodb.enabled:
         analysis = mongo_find_one("analysis", {"info.id": task_id}, sort=[("_id", -1)])
         for process in analysis.get("behavior", {}).get("processes", []):
@@ -407,6 +509,20 @@ def _load_report(task_id: int):
 
 
 def parse_id(id_string: str):
+    """
+    Parses a string representing a range or list of ranges of IDs and returns a list of tuples.
+
+    Args:
+        id_string (str): A string representing IDs. It can be "auto" or a string of comma-separated
+            ranges (e.g., "1-3,5,7-9").
+
+    Returns:
+        list: A list of tuples where each tuple represents a range of IDs. If the input is "auto",
+            it returns the string "auto".
+
+    Raises:
+        TypeError: If the input string is not in the correct format or if a range is invalid.
+    """
     if id_string == "auto":
         return id_string
     id_string = id_string.replace(" ", "")
@@ -486,6 +602,7 @@ def main():
         default=False,
         required=False,
     )
+    parser.add_argument("--disable-memory-limit", help="Disable memory limit.", action="store_true", default=False, required=False)
     args = parser.parse_args()
 
     init_database()
@@ -499,6 +616,7 @@ def main():
             memory_debugging=args.memory_debugging,
             processing_timeout=args.processing_timeout,
             debug=args.debug,
+            disable_memory_limit= args.disable_memory_limit,
         )
     else:
         for start, end in args.id:

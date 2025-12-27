@@ -57,7 +57,13 @@ def get_json_document(results, analysis_path):
     # Create a copy of the dictionary. This is done in order to not modify
     # the original dictionary and possibly
     # compromise the following reporting modules.
-    report = copy.deepcopy(results)
+    try:
+        report = copy.deepcopy(results)
+    except AttributeError:
+        if "memory" in results:
+            del results["memory"]
+            log.error("Deleting Volatility results")
+            report = copy.deepcopy(results)
 
     if "network" not in report:
         report["network"] = {}
@@ -119,10 +125,9 @@ def insert_calls(report, elastic_db=None, mongodb=False):
                 chunk_id = None
                 # If the chunk size is CHUNK_CALL_SIZE or if the loop is completed then store the chunk in DB.
                 if len(chunk) == CHUNK_CALL_SIZE:
-                    to_insert = {"pid": process["process_id"], "calls": chunk}
+                    to_insert = {"pid": process["process_id"], "calls": chunk , "task_id": report["info"]["id"]}
                     with suppress(Exception):
                         chunk_id = mongo_insert_one("calls", to_insert).inserted_id
-
                     if chunk_id:
                         chunks_ids.append(chunk_id)
                     # Reset the chunk.
@@ -133,10 +138,9 @@ def insert_calls(report, elastic_db=None, mongodb=False):
             # Store leftovers.
             if chunk:
                 chunk_id = None
-                to_insert = {"pid": process["process_id"], "calls": chunk}
+                to_insert = {"pid": process["process_id"], "calls": chunk, "task_id": report["info"]["id"]}
                 with suppress(Exception):
                     chunk_id = mongo_insert_one("calls", to_insert).inserted_id
-
                 if chunk_id:
                     chunks_ids.append(chunk_id)
 
@@ -157,5 +161,4 @@ def insert_calls(report, elastic_db=None, mongodb=False):
         # Add list of chunks.
         new_process["calls"] = chunks_ids
         new_processes.append(new_process)
-
     return new_processes

@@ -109,6 +109,13 @@ class MongoDB(Report):
         # reporting modules.
         report = get_json_document(results, self.analysis_path)
 
+        mongo_delete_data(int(report["info"]["id"]))
+        log.debug("Deleted previous MongoDB data for Task %s", report["info"]["id"])
+
+        # trick for distributed api
+        if results.get("info", {}).get("options", {}).get("main_task_id", ""):
+            report["info"]["id"] = int(results["info"]["options"]["main_task_id"])
+
         if "network" not in report:
             report["network"] = {}
 
@@ -117,13 +124,6 @@ class MongoDB(Report):
         report["behavior"] = dict(report["behavior"])
         report["behavior"]["processes"] = new_processes
 
-        # trick for distributed api
-        if results.get("info", {}).get("options", {}).get("main_task_id", ""):
-            report["info"]["id"] = int(results["info"]["options"]["main_task_id"])
-
-        mongo_delete_data(int(report["info"]["id"]))
-        log.debug("Deleted previous MongoDB data for Task %s", report["info"]["id"])
-
         ensure_valid_utf8(report)
         gc.collect()
 
@@ -131,9 +131,13 @@ class MongoDB(Report):
         try:
             mongo_insert_one("analysis", report)
         except OperationFailure as e:
-            # ToDo rewrite how children are stored
-            if str(e).startswith("BSONObj exceeds maximum nested object"):
-                log.debug("Deleting behavior process tree children from results.")
+            # Check for error codes indicating the BSON object was too large
+            # (10334 BSONObjectTooLarge) or the maximum nested object depth was
+            # exceeded (15 Overflow).
+            if e.code in (10334, 15):
+                log.error("Got MongoDB OperationFailure, code %d", e.code)
+                # ToDo rewrite how children are stored
+                log.warning("Deleting behavior process tree children from results.")
                 del report["behavior"]["processtree"][0]["children"]
                 try:
                     mongo_insert_one("analysis", report)
@@ -141,6 +145,8 @@ class MongoDB(Report):
                     log.error("Deleting behavior process tree parent from results: %s", str(e))
                     del report["behavior"]["processtree"][0]
                     mongo_insert_one("analysis", report)
+            else:
+                raise CuckooReportError("Failed inserting report in Mongo") from e
         except InvalidDocument as e:
             if str(e).startswith("cannot encode object") or "must not contain" in str(e):
                 self.loop_saver(report)
@@ -164,12 +170,12 @@ class MongoDB(Report):
                                 for j, parent_dict in enumerate(report[parent_key]):
                                     child_key, csize = self.debug_dict_size(parent_dict)[0]
                                     if csize > size_filter:
-                                        log.warn("results['%s']['%s'] deleted due to size: %s", parent_key, child_key, csize)
+                                        log.warning("results['%s']['%s'] deleted due to size: %s", parent_key, child_key, csize)
                                         del report[parent_key][j][child_key]
                         else:
                             child_key, csize = self.debug_dict_size(report[parent_key])[0]
                             if csize > size_filter:
-                                log.warn("results['%s']['%s'] deleted due to size: %s", parent_key, child_key, csize)
+                                log.warning("results['%s']['%s'] deleted due to size: %s", parent_key, child_key, csize)
                                 del report[parent_key][child_key]
                         try:
                             mongo_insert_one("analysis", report)

@@ -28,7 +28,6 @@ from lib.cuckoo.core.startup import init_rooter, init_routing
 init_rooter()
 init_routing()
 
-
 cfg = Config("reporting")
 aux_cfg = Config("auxiliary")
 web_cfg = Config("web")
@@ -88,12 +87,6 @@ ZIPPED_DOWNLOAD_ALL = zip_cfg.get("download_all", False)
 MOLOCH_BASE = moloch_cfg.get("base")
 MOLOCH_NODE = moloch_cfg.get("node")
 MOLOCH_ENABLED = moloch_cfg.get("enabled", False)
-
-VTDL_ENABLED = web_cfg.download_services.get("virustotal", False)
-VTDL_KEY = web_cfg.download_services.get("vtkey", False)
-
-BAZAAR_ENABLED = web_cfg.download_services.get("malwarebazaar", False)
-
 TEMP_PATH = Config().cuckoo.get("tmppath", "/tmp")
 
 # DEPRECATED - Enabled/Disable Zer0m0n tickbox on the submission page
@@ -118,8 +111,7 @@ SITE_ID = 1
 USE_I18N = True
 
 # Deprecated in Django 5.0
-# If you set this to False, Django will not format dates, numbers and
-# calendars according to the current locale.
+# If you set this to False, Django will not format dates, numbers and calendars according to the current locale.
 USE_L10N = True
 
 # Disabling time zone support and using local time for web interface and storage.
@@ -159,7 +151,9 @@ MEDIA_URL = ""
 # Don't put anything in this directory yourself; store your static files
 # in apps' "static/" subdirectories and in STATICFILES_DIRS.
 # Example: "/home/media/media.lawrence.com/static/"
+# When NGINX is as reverse proxy you need to put next line in local_settings.py
 STATIC_ROOT = ""
+
 
 # URL prefix for static files.
 # Example: "http://media.lawrence.com/static/"
@@ -221,6 +215,7 @@ MIDDLEWARE = [
     # in case you want custom auth, place logic in web/web/middleware/custom_auth.py
     # "web.middleware.CustomAuth",
     "web.middleware.DBTransactionMiddleware",
+    "allauth.account.middleware.AccountMiddleware",
 ]
 
 OTP_TOTP_ISSUER = "CAPE Sandbox"
@@ -257,109 +252,14 @@ INSTALLED_APPS = [
     "allauth",
     "allauth.account",
     "allauth.socialaccount",
-    "allauth.socialaccount.providers.agave",
-    "allauth.socialaccount.providers.amazon",
-    "allauth.socialaccount.providers.amazon_cognito",
-    "allauth.socialaccount.providers.angellist",
-    "allauth.socialaccount.providers.apple",
-    "allauth.socialaccount.providers.asana",
-    "allauth.socialaccount.providers.auth0",
-    "allauth.socialaccount.providers.authentiq",
-    "allauth.socialaccount.providers.azure",
-    "allauth.socialaccount.providers.baidu",
-    "allauth.socialaccount.providers.basecamp",
-    "allauth.socialaccount.providers.battlenet",
-    "allauth.socialaccount.providers.bitbucket",
-    "allauth.socialaccount.providers.bitbucket_oauth2",
-    "allauth.socialaccount.providers.bitly",
-    "allauth.socialaccount.providers.box",
-    "allauth.socialaccount.providers.cern",
-    "allauth.socialaccount.providers.coinbase",
-    "allauth.socialaccount.providers.dataporten",
-    "allauth.socialaccount.providers.daum",
-    "allauth.socialaccount.providers.digitalocean",
-    "allauth.socialaccount.providers.discord",
-    "allauth.socialaccount.providers.disqus",
-    "allauth.socialaccount.providers.douban",
-    "allauth.socialaccount.providers.doximity",
-    "allauth.socialaccount.providers.draugiem",
-    "allauth.socialaccount.providers.dropbox",
-    "allauth.socialaccount.providers.dwolla",
-    "allauth.socialaccount.providers.edmodo",
-    "allauth.socialaccount.providers.edx",
-    "allauth.socialaccount.providers.eventbrite",
-    "allauth.socialaccount.providers.eveonline",
-    "allauth.socialaccount.providers.evernote",
-    "allauth.socialaccount.providers.exist",
-    "allauth.socialaccount.providers.facebook",
-    "allauth.socialaccount.providers.feedly",
-    "allauth.socialaccount.providers.figma",
-    "allauth.socialaccount.providers.fivehundredpx",
-    "allauth.socialaccount.providers.flickr",
-    "allauth.socialaccount.providers.foursquare",
-    "allauth.socialaccount.providers.fxa",
-    "allauth.socialaccount.providers.github",
-    "allauth.socialaccount.providers.gitlab",
-    "allauth.socialaccount.providers.globus",
-    "allauth.socialaccount.providers.google",
-    "allauth.socialaccount.providers.hubic",
-    "allauth.socialaccount.providers.instagram",
-    "allauth.socialaccount.providers.jupyterhub",
-    "allauth.socialaccount.providers.kakao",
-    "allauth.socialaccount.providers.keycloak",
-    "allauth.socialaccount.providers.line",
-    "allauth.socialaccount.providers.linkedin",
-    "allauth.socialaccount.providers.linkedin_oauth2",
-    "allauth.socialaccount.providers.mailchimp",
-    "allauth.socialaccount.providers.mailru",
-    "allauth.socialaccount.providers.meetup",
-    "allauth.socialaccount.providers.microsoft",
-    "allauth.socialaccount.providers.naver",
-    "allauth.socialaccount.providers.nextcloud",
-    "allauth.socialaccount.providers.odnoklassniki",
-    "allauth.socialaccount.providers.openid",
-    "allauth.socialaccount.providers.openstreetmap",
-    "allauth.socialaccount.providers.orcid",
-    "allauth.socialaccount.providers.patreon",
-    "allauth.socialaccount.providers.paypal",
-    "allauth.socialaccount.providers.persona",
-    "allauth.socialaccount.providers.pinterest",
-    "allauth.socialaccount.providers.quickbooks",
-    "allauth.socialaccount.providers.reddit",
-    "allauth.socialaccount.providers.robinhood",
-    "allauth.socialaccount.providers.salesforce",
-    "allauth.socialaccount.providers.sharefile",
-    "allauth.socialaccount.providers.shopify",
-    "allauth.socialaccount.providers.slack",
-    "allauth.socialaccount.providers.soundcloud",
-    "allauth.socialaccount.providers.spotify",
-    "allauth.socialaccount.providers.stackexchange",
-    "allauth.socialaccount.providers.steam",
-    "allauth.socialaccount.providers.stocktwits",
-    "allauth.socialaccount.providers.strava",
-    "allauth.socialaccount.providers.stripe",
-    "allauth.socialaccount.providers.telegram",
-    "allauth.socialaccount.providers.trello",
-    "allauth.socialaccount.providers.tumblr",
-    "allauth.socialaccount.providers.twentythreeandme",
-    "allauth.socialaccount.providers.twitch",
-    "allauth.socialaccount.providers.twitter",
-    "allauth.socialaccount.providers.untappd",
-    "allauth.socialaccount.providers.vimeo",
-    "allauth.socialaccount.providers.vimeo_oauth2",
-    "allauth.socialaccount.providers.vk",
-    "allauth.socialaccount.providers.weibo",
-    "allauth.socialaccount.providers.weixin",
-    "allauth.socialaccount.providers.windowslive",
-    "allauth.socialaccount.providers.xing",
-    "allauth.socialaccount.providers.yahoo",
-    "allauth.socialaccount.providers.yandex",
-    "allauth.socialaccount.providers.ynab",
-    "allauth.socialaccount.providers.zoho",
-    "allauth.socialaccount.providers.zoom",
-    "allauth.socialaccount.providers.okta",
+    # Keeping this as example but disabling as some of them has extra dependencies. Check official docs.
+    # "allauth.socialaccount.providers.github",
+    # "allauth.socialaccount.providers.gitlab",
+    # "allauth.socialaccount.providers.google",
+    # "allauth.socialaccount.providers.microsoft",
     "crispy_forms",
-    "captcha",  # https://pypi.org/project/django-recaptcha/
+    "crispy_bootstrap4",
+    "django_recaptcha",  # https://pypi.org/project/django-recaptcha/
     "rest_framework",
     "rest_framework.authtoken",
 ]
@@ -388,6 +288,7 @@ TWOFA = web_cfg.web_auth.get("2fa", False)
 
 NOCAPTCHA = web_cfg.web_auth.get("captcha", False)
 # create your keys here -> https://www.google.com/recaptcha/about/
+# Set those in local_settings.py
 RECAPTCHA_PRIVATE_KEY = "TEST_PUBLIC_KEY"
 RECAPTCHA_PUBLIC_KEY = "TEST_PRIVATE_KEY"
 RECAPTCHA_DEFAULT_ACTION = "generic"
@@ -423,7 +324,7 @@ if web_cfg.registration.get("email_confirmation", False):
 
 SITE_ID = 1
 
-# https://django-allauth.readthedocs.io/en/latest/configuration.html
+# https://docs.allauth.org/en/dev/socialaccount/configuration.html
 if web_cfg.registration.get("email_confirmation", False):
     ACCOUNT_EMAIL_VERIFICATION = "mandatory"
     SOCIALACCOUNT_EMAIL_VERIFICATION = ACCOUNT_EMAIL_VERIFICATION
@@ -433,13 +334,24 @@ else:
 
 ACCOUNT_EMAIL_REQUIRED = web_cfg.registration.get("email_required", False)
 ACCOUNT_EMAIL_SUBJECT_PREFIX = web_cfg.registration.get("email_prefix_subject", False)
-ACCOUNT_LOGIN_ATTEMPTS_LIMIT = 3
+ACCOUNT_RATE_LIMITS = {"login_failed": "3/m"}
 LOGIN_REDIRECT_URL = "/"
 ACCOUNT_LOGOUT_REDIRECT_URL = "/accounts/login/"
 MANUAL_APPROVE = web_cfg.registration.get("manual_approve", False)
 REGISTRATION_ENABLED = web_cfg.registration.get("enabled", False)
 EMAIL_CONFIRMATION = web_cfg.registration.get("email_confirmation", False)
-#### ALlauth end
+SOCIAL_AUTH_EMAIL_DOMAIN = web_cfg.web_auth.get("social_auth_email_domain", False)
+
+# be careful with SOCIALACCOUNT_AUTO_SIGNUP, if True, it will bypass custom sighup functions, default is True
+# SOCIALACCOUNT_AUTO_SIGNUP = True
+# SOCIALACCOUNT_ONLY = True
+# SOCIALACCOUNT_LOGIN_ON_GET=True
+# ACCOUNT_SIGNUP_FORM_CLASS = None
+# In case you want to verify domain of email + set the username
+# SOCIALACCOUNT_ADAPTER = 'web.allauth_adapters.MySocialAccountAdapter'
+# ACCOUNT_DEFAULT_HTTP_PROTOCOL = "https"
+
+#### AllAuth end
 
 if web_cfg.registration.get("disposable_email_disable", False):
     DISPOSABLE_DOMAIN_LIST = os.path.join(CUCKOO_PATH, web_cfg.registration.disposable_domain_list)
@@ -484,7 +396,7 @@ ALLOWED_HOSTS = ["*"]
 
 # Max size
 MAX_UPLOAD_SIZE = web_cfg.general.max_sample_size
-
+# Google's OAuth might need: "strict-origin-when-cross-origin"
 SECURE_REFERRER_POLICY = "same-origin"  # "no-referrer-when-downgrade"
 
 # https://django-csp.readthedocs.io/en/latest/configuration.html

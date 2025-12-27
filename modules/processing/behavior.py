@@ -3,6 +3,7 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import datetime
+import json
 import logging
 import os
 import struct
@@ -25,6 +26,12 @@ from lib.cuckoo.common.utils import (
 
 log = logging.getLogger(__name__)
 cfg = Config()
+integrations_conf = Config("integrations")
+
+HAVE_FLARE_CAPA = False
+# required to not load not enabled dependencies
+if integrations_conf.flare_capa.enabled and integrations_conf.flare_capa.behavior:
+    from lib.cuckoo.common.integrations.capa import HAVE_FLARE_CAPA, flare_capa_details
 
 
 class ParseProcessLog(list):
@@ -309,7 +316,7 @@ class ParseProcessLog(list):
             try:
                 argument["value"] = convert_to_printable(arg_value, self.conversion_cache)
             except Exception:
-                log.error(arg_value, exc_info=True)
+                log.exception(arg_value)
                 continue
             if not self.reporting_mode:
                 if isinstance(arg_value_raw, bytes):
@@ -351,6 +358,16 @@ class ParseProcessLog(list):
         # add the thread id to our thread set
         if call["thread_id"] not in self.threads:
             self.threads.append(call["thread_id"])
+
+        if (
+            api_name == "DllLoadNotification"
+            and len(arguments) == 3
+            and arguments[-1].get("name", "") == "DllBase"
+            and arguments[0].get("value", "") == "load"
+            and "DllBase" not in self.environdict
+            and _clean_path(arguments[1]["value"], self.options.replace_patterns) in self.environdict.get("CommandLine", "")
+        ):
+            self.environdict.setdefault("DllBase", arguments[-1]["value"])
 
         return call
 
@@ -399,8 +416,7 @@ class Processes:
             if current_log.process_id is None:
                 continue
 
-            # If the current log actually contains any data, add its data to
-            # the results list.
+            # If the current log actually contains any data, add its data to the results list.
             results.append(
                 {
                     "process_id": current_log.process_id,
@@ -1170,31 +1186,66 @@ class BehaviorAnalysis(Processing):
         """Run analysis.
         @return: results dict.
         """
-        behavior = {"processes": Processes(self.logs_path, self.task, self.options).run()}
 
-        instances = [
-            Anomaly(),
-            ProcessTree(),
-            Summary(self.options),
-            Enhanced(),
-            EncryptedBuffers(),
-        ]
-        enabled_instances = [instance for instance in instances if getattr(self.options, instance.key, True)]
+        behavior = {"processes": []}
+        if path_exists(self.logs_path) and len(os.listdir(self.logs_path)) != 0:
+            behavior = {"processes": Processes(self.logs_path, self.task, self.options).run()}
 
-        if enabled_instances:
-            # Iterate calls and tell interested signatures about them
-            for process in behavior["processes"]:
-                for call in process["calls"]:
-                    for instance in enabled_instances:
-                        try:
-                            instance.event_apicall(call, process)
-                        except Exception:
-                            log.exception('Failure in partial behavior "%s"', instance.key)
+            instances = [
+                Anomaly(),
+                ProcessTree(),
+                Summary(self.options),
+                Enhanced(),
+                EncryptedBuffers(),
+            ]
+            enabled_instances = [instance for instance in instances if getattr(self.options, instance.key, True)]
 
-        for instance in instances:
+            if enabled_instances:
+                # Iterate calls and tell interested signatures about them
+                for process in behavior["processes"]:
+                    for call in process["calls"]:
+                        for instance in enabled_instances:
+                            try:
+                                instance.event_apicall(call, process)
+                            except Exception:
+                                log.exception('Failure in partial behavior "%s"', instance.key)
+
+            for instance in instances:
+                try:
+                    behavior[instance.key] = instance.run()
+                except Exception as e:
+                    log.exception('Failed to run partial behavior class "%s" due to "%s"', instance.key, e)
+        else:
+            log.warning('Analysis results folder does not exist at path "%s"', self.logs_path)
+            # load behavior from json if exist or env CAPE_REPORT variable
+            json_path = False
+            if os.environ.get("CAPE_REPORT") and path_exists(os.environ["CAPE_REPORT"]):
+                json_path = os.environ["CAPE_REPORT"]
+            elif os.path.exists(os.path.join(self.reports_path, "report.json")):
+                json_path = os.path.join(self.reports_path, "report.json")
+
+            if not json_path:
+                return behavior
+
+            with open(json_path) as f:
+                try:
+                    behavior = json.load(f).get("behavior", [])
+                except Exception as e:
+                    log.error("Behavior. Can't load json: %s", str(e))
+
+        # https://github.com/mandiant/capa/issues/2620
+        if (
+            HAVE_FLARE_CAPA
+            and self.results.get("info", {}).get("category", "") == "file"
+            and "PE" in self.results.get("target", {}).get("file", "").get("type", "")
+        ):
             try:
-                behavior[instance.key] = instance.run()
+                self.results["capa_summary"] = flare_capa_details(
+                    file_path=self.results["target"]["file"]["path"],
+                    category="behavior",
+                    backend="cape",
+                    results={"behavior": behavior, **self.results},
+                )
             except Exception as e:
-                log.exception('Failed to run partial behavior class "%s" due to "%s"', instance.key, e)
-
+                log.error("Can't generate CAPA summary: %s", str(e))
         return behavior

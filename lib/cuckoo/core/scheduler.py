@@ -8,6 +8,7 @@ import logging
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -64,6 +65,8 @@ class Scheduler:
         self.analysis_threads: List[AnalysisManager] = []
         self.analyzing_categories, categories_need_VM = load_categories()
         self.machinery_manager = MachineryManager() if categories_need_VM else None
+        if self.cfg.cuckoo.get("task_timeout", False):
+            self.next_timeout_time = time.time() + self.cfg.cuckoo.get("task_timeout_scan_interval", 30)
         log.info("Creating scheduler with max_analysis_count=%s", self.max_analysis_count or "unlimited")
 
     @property
@@ -97,6 +100,12 @@ class Scheduler:
 
         if self.is_short_on_disk_space():
             return SchedulerCycleDelay.LOW_DISK_SPACE
+
+        if self.cfg.cuckoo.get("task_timeout", False):
+            if self.next_timeout_time < time.time():
+                self.next_timeout_time = time.time() + self.cfg.cuckoo.get("task_timeout_scan_interval", 30)
+                with self.db.session.begin():
+                    self.db.clean_timed_out_tasks(self.cfg.cuckoo.get("task_pending_timeout", 0))
 
         analysis_manager: Optional[AnalysisManager] = None
         with self.db.session.begin():
@@ -168,6 +177,9 @@ class Scheduler:
 
         task: Optional[Task] = None
         machine: Optional[Machine] = None
+        # Cache available machine stats to avoid repeated DB queries within the loop.
+        available_tags_stats = self.get_available_machine_stats()
+
         # Get the list of all pending tasks in the order that they should be processed.
         for task_candidate in self.db.list_tasks(
             status=TASK_PENDING,
@@ -183,11 +195,32 @@ class Scheduler:
             try:
                 machine = self.machinery_manager.find_machine_to_service_task(task_candidate)
             except CuckooUnserviceableTaskError:
+                requested_tags = ", ".join(tag.name for tag in task_candidate.tags)
+                log_message = (
+                    "Task #{task_id}: {status} unserviceable task because no matching machine could be found. "
+                    "Requested tags: '{tags}'. Available machine tags: {available}. "
+                    "Please check your machinery configuration."
+                )
+
                 if self.cfg.cuckoo.fail_unserviceable:
-                    log.info("Task #%s: Failing unserviceable task", task_candidate.id)
+                    log.info(
+                        log_message.format(
+                            task_id=task_candidate.id,
+                            status="Failing",
+                            tags=requested_tags,
+                            available=available_tags_stats,
+                        )
+                    )
                     self.db.set_status(task_candidate.id, TASK_FAILED_ANALYSIS)
                 else:
-                    log.info("Task #%s: Unserviceable task", task_candidate.id)
+                    log.info(
+                        log_message.format(
+                            task_id=task_candidate.id,
+                            status="Unserviceable",
+                            tags=requested_tags,
+                            available=available_tags_stats,
+                        )
+                    )
                 continue
 
             if machine:
@@ -242,12 +275,7 @@ class Scheduler:
         # Resolve the full base path to the analysis folder, just in
         # case somebody decides to make a symbolic link out of it.
         dir_path = os.path.join(CUCKOO_ROOT, "storage", "analyses")
-        need_space, space_available = free_space_monitor(dir_path, return_value=True, analysis=True)
-        if need_space:
-            log.error(
-                "Not enough free disk space! (Only %d MB!). You can change limits it in cuckoo.conf -> freespace", space_available
-            )
-        return need_space
+        free_space_monitor(dir_path, analysis=True)
 
     @contextlib.contextmanager
     def loop_signals(self):
@@ -275,6 +303,8 @@ class Scheduler:
         elif sig == signal.SIGUSR1:
             log.info("received signal '%s', pausing new detonations, running detonations will continue until completion", sig.name)
             self.loop_state = LoopState.PAUSED
+            if self.cfg.cuckoo.ignore_signals:
+                sys.exit()
         elif sig == signal.SIGUSR2:
             log.info("received signal '%s', resuming detonations", sig.name)
             self.loop_state = LoopState.RUNNING
@@ -311,6 +341,8 @@ class Scheduler:
     def stop(self):
         """Set loop state to stopping."""
         self.loop_state = LoopState.STOPPING
+        if self.cfg.cuckoo.ignore_signals:
+            sys.exit()
 
     def thr_periodic_log(self, oneshot=False):
         # Ordinarily, this is the entry-point for a child thread. The oneshot parameter makes

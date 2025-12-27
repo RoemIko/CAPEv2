@@ -153,7 +153,7 @@ def create_zip(files=False, folder=False, encrypted=False):
 
     mem_zip = BytesIO()
     if encrypted and HAVE_PYZIPPER:
-        zipper = pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES)
+        zipper = pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES)
     else:
         zipper = zipfile.ZipFile(mem_zip, "a", zipfile.ZIP_DEFLATED, False)
     with zipper as zf:
@@ -340,6 +340,18 @@ def convert_to_printable(s: str, cache=None):
 
 def convert_to_printable_and_truncate(s: str, buf: int, cache=None):
     return convert_to_printable(f"{s[:buf]} <truncated>" if len(s) > buf else s, cache=cache)
+
+
+def truncate_str(s: str, max_length: int, marker=" <truncated>"):
+    """Truncate a string if its length exceeds the configured `max_length`.
+
+    If `max_length` is less than or equal to 0, the string is not modified.
+    If the string is truncated, `marker` is added to the end."""
+    truncate_size = min(max_length, len(s))
+    if truncate_size > 0 and truncate_size < len(s):
+        return f"{s[:truncate_size]}{marker}"
+    else:
+        return s
 
 
 def convert_filename_char(c):
@@ -559,12 +571,17 @@ def datetime_to_iso(timestamp):
     return datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").isoformat()
 
 
-def store_temp_file(filedata, filename, path=None):
-    """Store a temporary file.
-    @param filedata: content of the original file.
-    @param filename: name of the original file.
-    @param path: optional path for temp directory.
-    @return: path to the temporary file.
+def store_temp_file(filedata: bytes, filename: str, path=None) -> bytes:
+    """
+    Store a temporary file.
+
+    Args:
+        filedata (bytes or file-like object): Content of the original file.
+        filename (str): Name of the original file.
+        path (str, optional): Optional path for the temporary directory. Defaults to None.
+
+    Returns:
+        bytes: Path to the temporary file.
     """
     filename = path_get_filename(filename).encode("utf-8", "replace")
 
@@ -592,6 +609,7 @@ def store_temp_file(filedata, filename, path=None):
         else:
             tmp_file.write(filedata)
 
+    # ToDo consider change from bytes to str
     return tmp_file_path
 
 
@@ -757,9 +775,21 @@ def truncate_filename(x):
     return truncated
 
 
-def sanitize_filename(x):
-    """Kind of awful but necessary sanitizing of filenames to
-    get rid of unicode problems."""
+def sanitize_filename(x: str):
+    """
+    Sanitizes a given filename to remove problematic characters and ensure it is safe for use.
+
+    This function performs the following operations:
+    1. Strips leading spaces from the filename.
+    2. Replaces any character that is not an ASCII letter, digit, space, underscore, hyphen, or period with an underscore.
+    3. Truncates the filename if it exceeds a certain length to prevent issues with overly long filenames.
+
+    Args:
+        x (str): The filename to sanitize.
+
+    Returns:
+        str: The sanitized filename.
+    """
     while x.startswith(" "):
         x = x.lstrip()
     out = "".join(c if c in string.ascii_letters + string.digits + " _-." else "_" for c in x)

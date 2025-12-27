@@ -17,6 +17,25 @@ from pathlib import Path
 
 # Private
 import custom.signatures
+
+try:
+    import custom.signatures.all
+except ImportError:
+    HAS_CUSTOM_SIGNATURES_ALL = False
+else:
+    HAS_CUSTOM_SIGNATURES_ALL = True
+try:
+    import custom.signatures.linux
+except ImportError:
+    HAS_CUSTOM_SIGNATURES_LINUX = False
+else:
+    HAS_CUSTOM_SIGNATURES_LINUX = True
+try:
+    import custom.signatures.windows
+except ImportError:
+    HAS_CUSTOM_SIGNATURES_WINDOWS = False
+else:
+    HAS_CUSTOM_SIGNATURES_WINDOWS = True
 import modules.auxiliary
 import modules.feeds
 import modules.processing
@@ -99,14 +118,15 @@ def check_webgui_mongo():
         # with large amounts of data.
         # Note: Silently ignores the creation if the index already exists.
         mongo_create_index("analysis", "info.id", name="info.id_1")
-        # mongo_create_index([("target.file.sha256", TEXT)], name="target_sha256")
-        # We performs a lot of SHA256 hash lookup so we need this index
-        # mongo_create_index(
-        #     "analysis",
-        #     [("target.file.sha256", TEXT), ("dropped.sha256", TEXT), ("procdump.sha256", TEXT), ("CAPE.payloads.sha256", TEXT)],
-        #     name="ALL_SHA256",
-        # )
+        # Some indexes that can be useful for some users
+        mongo_create_index("files", "md5", name="file_md5")
         mongo_create_index("files", [("_task_ids", 1)])
+
+        # side indexes as ideas
+        """
+            mongo_create_index("analysis", "detections", name="detections_1")
+            mongo_create_index("analysis", "target.file.name", name="name_1")
+        """
 
     elif repconf.elasticsearchdb.enabled:
         # ToDo add check
@@ -164,7 +184,7 @@ class ConsoleHandler(logging.StreamHandler):
             colored.msg = red(record.msg)
         else:
             # Hack for pymongo.logger.LogMessage
-            if type(record.msg) != "str":
+            if not isinstance(record.msg, str):
                 record.msg = str(record.msg)
 
             if "analysis procedure completed" in record.msg:
@@ -180,9 +200,7 @@ def check_linux_dist():
     with suppress(AttributeError):
         platform_details = platform.dist()
         if platform_details[0] != "Ubuntu" and platform_details[1] not in ubuntu_versions:
-            log.info(
-                f"[!] You are using NOT supported Linux distribution by devs! Any issue report is invalid! We only support Ubuntu LTS {ubuntu_versions}"
-            )
+            log.info("[!] You are using NOT supported Linux distribution by devs! Any issue report is invalid! We only support Ubuntu LTS %s", ubuntu_versions)
 
 
 def init_logging(level: int):
@@ -272,6 +290,12 @@ def init_modules():
     import_package(modules.signatures.linux)
     # Import all private signatures
     import_package(custom.signatures)
+    if HAS_CUSTOM_SIGNATURES_ALL:
+        import_package(custom.signatures.all)
+    if HAS_CUSTOM_SIGNATURES_LINUX:
+        import_package(custom.signatures.linux)
+    if HAS_CUSTOM_SIGNATURES_WINDOWS:
+        import_package(custom.signatures.windows)
     if len(os.listdir(os.path.join(CUCKOO_ROOT, "modules", "signatures"))) < 5:
         log.warning("Suggestion: looks like you didn't install community, execute: poetry run python utils/community.py -h")
     # Import all reporting modules.
@@ -281,6 +305,7 @@ def init_modules():
 
     # Import machine manager.
     import_plugin(f"modules.machinery.{cuckoo.cuckoo.machinery}")
+    check_snapshot_state()
 
     for category, entries in list_plugins().items():
         log.debug('Imported "%s" modules:', category)
@@ -290,6 +315,95 @@ def init_modules():
                 log.debug("\t `-- %s", entry.__name__)
             else:
                 log.debug("\t |-- %s", entry.__name__)
+
+
+def check_snapshot_state():
+    """Checks the state of snapshots and machine architecture for KVM/QEMU machinery."""
+    if cuckoo.cuckoo.machinery not in ("kvm", "qemu"):
+        return
+
+    try:
+        import libvirt
+        from xml.etree import ElementTree
+    except ImportError:
+        raise CuckooStartupError(
+            "The 'libvirt-python' library is required for KVM/QEMU machinery but is not installed. "
+            "Please install it (e.g., 'cd /opt/CAPEv2/ ; sudo -u cape /etc/poetry/bin/poetry run extra/libvirt_installer.sh')."
+        )
+
+    machinery_config = Config(cuckoo.cuckoo.machinery)
+    dsn = machinery_config.get(cuckoo.cuckoo.machinery).get("dsn")
+    conn = None
+
+    try:
+        conn = libvirt.open(dsn)
+    except libvirt.libvirtError as e:
+        raise CuckooStartupError(f"Failed to connect to libvirt with DSN '{dsn}'. Error: {e}")
+
+    if conn is None:
+        raise CuckooStartupError(f"Failed to connect to libvirt with DSN '{dsn}'. Please check your configuration and libvirt service.")
+
+    try:
+        for machine_name in machinery_config.get(cuckoo.cuckoo.machinery).machines.split(","):
+            machine_name = machine_name.strip()
+            if not machine_name:
+                continue
+
+            snapshot_name = ""
+            try:
+                machine_config = machinery_config.get(machine_name)
+                machine_name = machine_config.get("label")
+                domain = conn.lookupByName(machine_name)
+                # Check for valid architecture configuration.
+                arch = machine_config.get("arch")
+                if not arch:
+                    raise CuckooStartupError(f"Missing 'arch' configuration for VM '{machine_name}'. Please specify a valid architecture (e.g., x86, x64).")
+
+                if arch == "x86_64":
+                    raise CuckooStartupError(
+                        f"Invalid architecture '{arch}' for VM '{machine_name}'. Please use 'x64' instead of 'x86_64'."
+                    )
+
+                if arch != arch.lower():
+                    raise CuckooStartupError(
+                        f"Invalid architecture '{arch}' for VM '{machine_name}'. Architecture must be all lowercase."
+                    )
+
+                # Check snapshot state.
+                snapshot_name = machine_config.get("snapshot")
+                snapshot = None
+
+                if snapshot_name:
+                    snapshot = domain.snapshotLookupByName(snapshot_name)
+                else:
+                    if domain.hasCurrentSnapshot(0):
+                        snapshot = domain.snapshotCurrent(0)
+                        snapshot_name = snapshot.getName()
+                        log.info("No snapshot name configured for VM '%s', checking latest: '%s'", machine_name, snapshot_name)
+                    else:
+                        log.warning("No snapshot configured or found for VM '%s'. Skipping check.", machine_name)
+                        continue
+
+                xml_desc = snapshot.getXMLDesc(0)
+                root = ElementTree.fromstring(xml_desc)
+                state_element = root.find("state")
+
+                if state_element is None or state_element.text != "running":
+                    state = state_element.text if state_element is not None else "unknown"
+                    raise CuckooStartupError(
+                        f"Snapshot '{snapshot_name}' for VM '{machine_name}' is not in a 'running' state (current state: '{state}'). "
+                        "Please ensure you take snapshots of running VMs."
+                    )
+
+            except libvirt.libvirtError as e:
+                # It's possible a snapshot name is provided but doesn't exist, which is a config error.
+                snapshot_identifier = f"with snapshot '{snapshot_name}'" if snapshot_name else ""
+                raise CuckooStartupError(
+                    f"Error checking snapshot state for VM '{machine_name}' {snapshot_identifier}. Libvirt error: {e}"
+                )
+    finally:
+        if conn:
+            conn.close()
 
 
 def init_rooter():
@@ -537,4 +651,4 @@ def check_vms_n_resultserver_networking():
         vm_ip, vm_rs = network
         # is there are better way to check networkrange without range CIDR?
         if not resultserver_block.startswith(vm_ip) or (vm_rs and not vm_rs.startswith(vm_ip)):
-            log.error(f"Your resultserver and VM:{vm} are in different nework ranges. This might give you: CuckooDeadMachine")
+            log.error("Your resultserver and VM: %s are in different nework ranges. This might give you: CuckooDeadMachine", vm)

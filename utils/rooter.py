@@ -6,6 +6,7 @@
 import argparse
 import errno
 import grp
+import ipaddress
 import json
 import logging.handlers
 import os
@@ -15,8 +16,8 @@ import stat
 import subprocess
 import sys
 
-if sys.version_info[:2] < (3, 8):
-    sys.exit("You are running an incompatible version of Python, please use >= 3.8")
+if sys.version_info[:2] < (3, 10):
+    sys.exit("You are running an incompatible version of Python, please use >= 3.10")
 
 CUCKOO_ROOT = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..")
 sys.path.append(CUCKOO_ROOT)
@@ -30,7 +31,6 @@ ch = logging.StreamHandler()
 ch.setFormatter(formatter)
 log.addHandler(ch)
 log.setLevel(logging.INFO)
-
 
 class s:
     iptables = None
@@ -47,20 +47,75 @@ def run(*args):
     return stdout, stderr
 
 
+def get_tun_peer_address(interface_name):
+    """Gets the peer address of a tun interface.
+
+    Args:
+        interface_name: The name of the tun interface (e.g., "tun0").
+        Format similar to:
+        inet 172.30.1.5 peer 172.30.1.6/32 scope global
+
+    Returns:
+        The peer IP address as a string, or None if an error occurs.  Returns None if the interface does not exist, or does not have a peer.
+    """
+    try:
+        result = subprocess.run(["ip", "addr", "show", interface_name], capture_output=True, text=True, check=True)
+        output = result.stdout
+
+        for line in output.splitlines():
+            if "peer" in line:
+                parts = line.split()
+                if len(parts) > 1:  # Check if there's a second element to avoid IndexError
+                    peer_with_cidr = parts[3]
+                    try:
+                        # Handle CIDR notation using ipaddress library
+                        peer_ip = ipaddress.ip_interface(peer_with_cidr).ip.exploded
+                        return peer_ip
+                    except ValueError:  # Handle invalid CIDR notations
+                        try:
+                            peer_ip = peer_with_cidr.split("/")[0]  # Try just splitting by /
+                            return peer_ip
+                        except IndexError:
+                            return None  # Invalid format - give up.
+                else:
+                    return None  # No peer address found on the line.
+        return None  # "peer" not found in the output
+
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 1:  # Interface not found
+            return None
+        else:
+            print(f"Error executing ip command: {e}")
+            return None
+    except FileNotFoundError:
+        print("ip command not found. Is iproute2 installed?")
+        return None
+
+
+def enable_ip_forwarding(sysctl="/usr/sbin/sysctl"):
+    log.debug("Enabling IPv4 forwarding")
+    run(sysctl, "-w" "net.ipv4.ip_forward=1")
+
+
 def check_tuntap(vm_name, main_iface):
     """Create tuntap device for qemu vms"""
     try:
-        run([s.ip, "tuntap", "add", "dev", f"tap_{vm_name}", "mode", "tap", "user", username])
-        run([s.ip, "link", "set", "tap_{vm_name}", "master", main_iface])
-        run([s.ip, "link", "set", "dev", "tap_{vm_name}", "up"])
-        run([s.ip, "link", "set", "dev", main_iface, "up"])
+        run(s.ip, "tuntap", "add", "dev", f"tap_{vm_name}", "mode", "tap", "user", username)
+        run(s.ip, "link", "set", "tap_{vm_name}", "master", main_iface)
+        run(s.ip, "link", "set", "dev", "tap_{vm_name}", "up")
+        run(s.ip, "link", "set", "dev", main_iface, "up")
         return True
     except subprocess.CalledProcessError:
         return False
 
 
-def run_iptables(*args):
-    iptables_args = [s.iptables]
+def run_iptables(*args, **kwargs):
+    if kwargs and kwargs.get('netns'):
+        netns = kwargs.get('netns')
+        iptables_args = ["/usr/sbin/ip", "netns", "exec", netns, s.iptables]
+    else:
+        iptables_args = [s.iptables]
+
     iptables_args.extend(list(args))
     iptables_args.extend(["-m", "comment", "--comment", "CAPE-rooter"])
     return run(*iptables_args)
@@ -148,7 +203,7 @@ def delete_dev_from_vrf(dev):
 def vpn_status(name):
     """Gets current VPN status."""
     ret = {}
-    for line in run(settings.systemctl, "status", "openvpn@{}.service".format(name))[0].split("\n"):
+    for line in run(settings.systemctl, "status", f"openvpn@{name}.service")[0].split("\n"):
         if "running" in line:
             ret[name] = "running"
             break
@@ -187,6 +242,229 @@ def disable_nat(interface):
     """Disable NAT on this interface."""
     run_iptables("-t", "nat", "-D", "POSTROUTING", "-o", interface, "-j", "MASQUERADE")
 
+
+def enable_mitmdump(interface, client, port, netns):
+    """Enable mitmdump on this interface."""
+
+    log.info("enable_mitmdump client: %s port: %s netns: %s", client, port, netns)
+
+    if netns:
+        # assume all traffic in network namespace can be captured
+        run_iptables(
+            "-t",
+            "nat",
+            "-I",
+            "PREROUTING",
+            "-p",
+            "tcp",
+            "--dport",
+            "443",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            port,
+            netns=netns,
+        )
+        run_iptables(
+            "-t",
+            "nat",
+            "-I",
+            "PREROUTING",
+            "-p",
+            "tcp",
+            "--dport",
+            "80",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            port,
+            netns=netns,
+        )
+    else:
+        run_iptables(
+            "-t",
+            "nat",
+            "-I",
+            "PREROUTING",
+            "-i",
+            interface,
+            "-s",
+            client,
+            "-p",
+            "tcp",
+            "--dport",
+            "443",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            port,
+        )
+        run_iptables(
+            "-t",
+            "nat",
+            "-I",
+            "PREROUTING",
+            "-i",
+            interface,
+            "-s",
+            client,
+            "-p",
+            "tcp",
+            "--dport",
+            "80",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            port
+        )
+
+
+def disable_mitmdump(interface, client, port, netns):
+    """Disable mitmdump on this interface."""
+
+    if netns:
+        run_iptables(
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-p",
+            "tcp",
+            "--dport",
+            "443",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            port,
+            netns=netns,
+        )
+        run_iptables(
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-p",
+            "tcp",
+            "--dport",
+            "80",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            port,
+            netns=netns,
+        )
+    else:
+        run_iptables(
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-i",
+            interface,
+            "-s",
+            client,
+            "-p",
+            "tcp",
+            "--dport",
+            "443",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            port,
+        )
+        run_iptables(
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-i",
+            interface,
+            "-s",
+            client,
+            "-p",
+            "tcp",
+            "--dport",
+            "80",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            port,
+        )
+
+def polarproxy_enable(interface, client, tls_port, proxy_port):
+    log.info("Enabling polarproxy route.")
+    run_iptables(
+        "-t",
+        "nat",
+        "-I",
+        "PREROUTING",
+        "1",
+        "-i",
+        interface,
+        "--source",
+        client,
+        "-p",
+        "tcp",
+        "--dport",
+        tls_port,
+        "-j",
+        "REDIRECT",
+        "--to",
+        proxy_port
+    )
+    run_iptables(
+        "-A",
+        "INPUT",
+        "-i",
+        interface,
+        "-p",
+        "tcp",
+        "--dport",
+        proxy_port,
+        "-m",
+        "state",
+        "--state",
+        "NEW",
+        "-j",
+        "ACCEPT"
+    )
+
+def polarproxy_disable(interface, client, tls_port, proxy_port):
+    log.info("Disabling polarproxy route.")
+    run_iptables(
+        "-t",
+        "nat",
+        "-D",
+        "PREROUTING",
+        "-i",
+        interface,
+        "--source",
+        client,
+        "-p",
+        "tcp",
+        "--dport",
+        tls_port,
+        "-j",
+        "REDIRECT",
+        "--to",
+        proxy_port
+    )
+    run_iptables(
+        "-D",
+        "INPUT",
+        "-i",
+        interface,
+        "-p",
+        "tcp",
+        "--dport",
+        proxy_port,
+        "-m",
+        "state",
+        "--state",
+        "NEW",
+        "-j",
+        "ACCEPT"
+    )
 
 def init_rttable(rt_table, interface):
     """Initialise routing table for this interface using routes
@@ -556,6 +834,50 @@ def inetsim_disable(ipaddr, inetsim_ip, dns_port, resultserver_port, ports):
     run_iptables("-D", "OUTPUT", "--source", ipaddr, "-j", "DROP")
 
 
+def interface_route_tun_enable(ipaddr: str, out_interface: str, task_id: str):
+    """Enable routing and NAT via tun output_interface."""
+    log.info("Enabling interface routing via: %s for task: %s", out_interface, task_id)
+
+    # mark packets from analysis VM
+    run_iptables("-t", "mangle", "-I", "PREROUTING", "--source", ipaddr, "-j", "MARK", "--set-mark", task_id)
+
+    run_iptables("-t", "nat", "-I", "POSTROUTING", "--source", ipaddr, "-o", out_interface, "-j", "MASQUERADE")
+    # ACCEPT forward
+    run_iptables("-t", "filter", "-I", "FORWARD", "--source", ipaddr, "-o", out_interface, "-j", "ACCEPT")
+
+    # in routing table add route table task_id
+    run(s.ip, "rule", "add", "fwmark", task_id, "lookup", task_id)
+
+    peer_ip = get_tun_peer_address(out_interface)
+    if peer_ip:
+        log.info("interface_route_enable %s has peer: %s ", out_interface, peer_ip)
+        run(s.ip, "route", "add", "default", "via", peer_ip, "table", task_id)
+    else:
+        log.error("interface_route_enable missing peer IP ")
+
+
+def interface_route_tun_disable(ipaddr: str, out_interface: str, task_id: str):
+    """Disable routing and NAT via tun output_interface."""
+    log.info("Disable interface routing via: %s for task: %s", out_interface, task_id)
+
+    # mark packets from analysis VM
+    run_iptables("-t", "mangle", "-D", "PREROUTING", "--source", ipaddr, "-j", "MARK", "--set-mark", task_id)
+
+    run_iptables("-t", "nat", "-D", "POSTROUTING", "--source", ipaddr, "-o", out_interface, "-j", "MASQUERADE")
+    # ACCEPT forward
+    run_iptables("-t", "filter", "-D", "FORWARD", "--source", ipaddr, "-o", out_interface, "-j", "ACCEPT")
+
+    # in routing table add route table task_id
+    run(s.ip, "rule", "del", "fwmark", task_id, "lookup", task_id)
+
+    peer_ip = get_tun_peer_address(out_interface)
+    if peer_ip:
+        log.info("interface_route_disable %s has peer %s", out_interface, peer_ip)
+        run(s.ip, "route", "del", "default", "via", peer_ip, "table", task_id)
+    else:
+        log.error("interface_route_disable missing peer IP ")
+
+
 def socks5_enable(ipaddr, resultserver_port, dns_port, proxy_port):
     """Enable hijacking of all traffic and send it to socks5."""
     log.info("Enabling socks route.")
@@ -665,6 +987,8 @@ handlers = {
     "srcroute_disable": srcroute_disable,
     "inetsim_enable": inetsim_enable,
     "inetsim_disable": inetsim_disable,
+    "interface_route_tun_enable": interface_route_tun_enable,
+    "interface_route_tun_disable": interface_route_tun_disable,
     "socks5_enable": socks5_enable,
     "socks5_disable": socks5_disable,
     "drop_enable": drop_enable,
@@ -674,6 +998,10 @@ handlers = {
     "cleanup_vrf": cleanup_vrf,
     "add_dev_to_vrf": add_dev_to_vrf,
     "delete_dev_from_vrf": delete_dev_from_vrf,
+    "enable_mitmdump": enable_mitmdump,
+    "disable_mitmdump": disable_mitmdump,
+    "polarproxy_enable": polarproxy_enable,
+    "polarproxy_disable": polarproxy_disable,
 }
 
 if __name__ == "__main__":
@@ -681,6 +1009,7 @@ if __name__ == "__main__":
     parser.add_argument("socket", nargs="?", default="/tmp/cuckoo-rooter", help="Unix socket path")
     parser.add_argument("-g", "--group", default="cape", help="Unix socket group")
     parser.add_argument("--systemctl", default="/bin/systemctl", help="Systemctl wrapper script for invoking OpenVPN")
+    parser.add_argument("--sysctl", default="/usr/sbin/sysctl", help="Path to sysctl")
     parser.add_argument("--iptables", default="/sbin/iptables", help="Path to iptables")
     parser.add_argument("--iptables-save", default="/sbin/iptables-save", help="Path to iptables-save")
     parser.add_argument("--iptables-restore", default="/sbin/iptables-restore", help="Path to iptables-restore")
@@ -704,8 +1033,13 @@ if __name__ == "__main__":
     if not settings.iptables or not path_exists(settings.iptables):
         sys.exit("The `iptables` binary is not available, eh?!")
 
+    if not settings.sysctl or not path_exists(settings.sysctl):
+        sys.exit("The `sysctrl` binary is not available, eh?!")
+
     if os.getuid():
         sys.exit("This utility is supposed to be ran as root.")
+
+    enable_ip_forwarding(settings.sysctl)
 
     if path_exists(settings.socket):
         path_delete(settings.socket)
@@ -800,14 +1134,6 @@ if __name__ == "__main__":
             try:
                 output = handlers[command](*args, **kwargs)
             except Exception as e:
-                log.exception("Error executing command: {}".format(command))
+                log.exception("Error executing command: %s", command)
                 error = str(e)
-            server.sendto(
-                json.dumps(
-                    {
-                        "output": output,
-                        "exception": error,
-                    }
-                ).encode(),
-                addr,
-            )
+            server.sendto(json.dumps({"output": output, "exception": error}).encode(), addr)

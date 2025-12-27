@@ -32,7 +32,13 @@ log = logging.getLogger(__name__)
 cuckoo_conf = Config()
 web_cfg = Config("web")
 tmp_path = cuckoo_conf.cuckoo.get("tmppath", "/tmp")
-linux_enabled = web_cfg.linux.get("enabled", False)
+linux_enabled = web_cfg.linux.get("enabled", False) or web_cfg.linux.get("static_only", False)
+
+try:
+    demux_files_limit = int(web_cfg.general.demux_files_limit)
+except ValueError:
+    log.error("Invalid value for demux_files_limit in web.conf, defaulting to 10")
+    demux_files_limit = 10  # Default value
 
 demux_extensions_list = {
     b".accdr",
@@ -162,7 +168,8 @@ def is_valid_package(package: str) -> bool:
     return any(ptype in package for ptype in VALID_PACKAGES)
 
 
-def _sf_children(child: sfFile) -> bytes:
+# ToDo fix return type
+def _sf_children(child: sfFile):  # -> bytes:
     path_to_extract = ""
     _, ext = os.path.splitext(child.filename)
     ext = ext.lower()
@@ -183,16 +190,18 @@ def _sf_children(child: sfFile) -> bytes:
                 path_to_extract = os.path.join(tmp_dir, sanitize_filename((child.filename).decode()))
                 _ = path_write_file(path_to_extract, child.contents)
         except Exception as e:
-            log.error(e, exc_info=True)
-    return path_to_extract.encode()
+            log.exception(e)
+    return (path_to_extract.encode(), child.platform, child.magic, child.filesize)
 
 
-def demux_sflock(filename: bytes, options: str, check_shellcode: bool = True) -> List[bytes]:
+# ToDo fix typing need to add str as error msg
+def demux_sflock(filename: bytes, options: str, check_shellcode: bool = True):  # -> List[bytes]:
     retlist = []
     # do not extract from .bin (downloaded from us)
     if os.path.splitext(filename)[1] == b".bin":
-        return retlist
+        return retlist, ""
 
+    # ToDo need to introduce error msgs here
     try:
         password = options2passwd(options) or "infected"
         try:
@@ -201,20 +210,35 @@ def demux_sflock(filename: bytes, options: str, check_shellcode: bool = True) ->
             unpacked = unpack(filename, check_shellcode=check_shellcode)
 
         if unpacked.package in whitelist_extensions:
-            return [filename]
+            file = File(filename)
+            magic_type = file.get_type()
+            platform = file.get_platform()
+            file_size = file.get_size()
+            return [[filename, platform, magic_type, file_size]], ""
         if unpacked.package in blacklist_extensions:
-            return [filename]
+            return [], "blacklisted package"
         for sf_child in unpacked.children:
             if sf_child.to_dict().get("children"):
-                retlist.extend(_sf_children(ch) for ch in sf_child.children)
+                for ch in sf_child.children:
+                    tmp_child = _sf_children(ch)
+                    # check if path is not empty
+                    if tmp_child and tmp_child[0]:
+                        retlist.append(tmp_child)
+
                 # child is not available, the original file should be put into the list
-                if filter(None, retlist):
-                    retlist.append(_sf_children(sf_child))
+                if not retlist:
+                    tmp_child = _sf_children(sf_child)
+                    # check if path is not empty
+                    if tmp_child and tmp_child[0]:
+                        retlist.append(tmp_child)
             else:
-                retlist.append(_sf_children(sf_child))
+                tmp_child = _sf_children(sf_child)
+                # check if path is not empty
+                if tmp_child and tmp_child[0]:
+                    retlist.append(tmp_child)
     except Exception as e:
-        log.error(e, exc_info=True)
-    return list(filter(None, retlist))
+        log.exception(e)
+    return list(filter(None, retlist)), ""
 
 
 def demux_sample(filename: bytes, package: str, options: str, use_sflock: bool = True, platform: str = ""):  # -> tuple[bytes, str]:
@@ -227,10 +251,10 @@ def demux_sample(filename: bytes, package: str, options: str, use_sflock: bool =
     if isinstance(filename, str) and use_sflock:
         filename = filename.encode()
 
+    error_list = []
     retlist = []
     # if a package was specified, trim if allowed and required
     if package:
-
         if package in ("msix",):
             retlist.append((filename, "windows"))
         else:
@@ -241,7 +265,15 @@ def demux_sample(filename: bytes, package: str, options: str, use_sflock: bool =
             else:
                 if web_cfg.general.enable_trim and trim_file(filename):
                     retlist.append((trimmed_path(filename), platform))
-        return retlist
+                else:
+                    error_list.append(
+                        {
+                            os.path.basename(
+                                filename
+                            ).decode(): "File too big, enable 'allow_ignore_size' in web.conf or use 'ignore_size_check' option"
+                        }
+                    )
+        return retlist, error_list
 
     # handle quarantine files
     tmp_path = unquarantine(filename)
@@ -259,9 +291,16 @@ def demux_sample(filename: bytes, package: str, options: str, use_sflock: bool =
         if use_sflock:
             if HAS_SFLOCK:
                 retlist = demux_office(filename, password, platform)
-                return retlist
+                return retlist, error_list
             else:
                 log.error("Detected password protected office file, but no sflock is installed: poetry install")
+                error_list.append(
+                    {
+                        os.path.basename(
+                            filename
+                        ).decode(): "Detected password protected office file, but no sflock is installed or correct password provided"
+                    }
+                )
 
     # don't try to extract from Java archives or executables
     if (
@@ -279,7 +318,15 @@ def demux_sample(filename: bytes, package: str, options: str, use_sflock: bool =
         else:
             if web_cfg.general.enable_trim and trim_file(filename):
                 retlist.append((trimmed_path(filename), platform))
-        return retlist
+            else:
+                error_list.append(
+                    {
+                        os.path.basename(
+                            filename
+                        ).decode(): "File too big, enable 'allow_ignore_size' in web.conf or use 'ignore_size_check' option",
+                    }
+                )
+        return retlist, error_list
 
     new_retlist = []
 
@@ -288,26 +335,34 @@ def demux_sample(filename: bytes, package: str, options: str, use_sflock: bool =
         check_shellcode = False
 
     # all in one unarchiver
-    retlist = demux_sflock(filename, options, check_shellcode) if HAS_SFLOCK and use_sflock else []
+    retlist, error_msg = demux_sflock(filename, options, check_shellcode) if HAS_SFLOCK and use_sflock else ([], "")
     # if it isn't a ZIP or an email, or we aren't able to obtain anything interesting from either, then just submit the
     # original file
     if not retlist:
+        if error_msg:
+            error_list.append({os.path.basename(filename).decode(): error_msg})
         new_retlist.append((filename, platform))
     else:
-        for filename in retlist:
+        for filename, platform, magic_type, file_size in retlist:
             # verify not Windows binaries here:
-            file = File(filename)
-            magic_type = file.get_type()
-            platform = file.get_platform()
             if platform == "linux" and not linux_enabled and "Python" not in magic_type:
+                error_list.append({os.path.basename(filename).decode(): "Linux processing is disabled"})
                 continue
 
-            if file.get_size() > web_cfg.general.max_sample_size and not (
-                web_cfg.general.allow_ignore_size and "ignore_size_check" in options
-            ):
-                if web_cfg.general.enable_trim:
-                    # maybe identify here
-                    if trim_file(filename):
-                        filename = trimmed_path(filename)
+            if file_size > web_cfg.general.max_sample_size:
+                if web_cfg.general.allow_ignore_size and "ignore_size_check" in options:
+                    if web_cfg.general.enable_trim:
+                        # maybe identify here
+                        if trim_file(filename):
+                            filename = trimmed_path(filename)
+                else:
+                    error_list.append(
+                        {
+                            os.path.basename(
+                                filename
+                            ).decode(): "File too big, enable 'allow_ignore_size' in web.conf or use 'ignore_size_check' option",
+                        }
+                    )
             new_retlist.append((filename, platform))
-    return new_retlist[:10]
+
+    return new_retlist[:demux_files_limit], error_list

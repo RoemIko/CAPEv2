@@ -37,11 +37,12 @@ from lib.cuckoo.common.utils import (
 )
 
 processing_conf = Config("processing")
+integrations_conf = Config("integrations")
 externalservices_conf = Config("externalservices")
 
 HAVE_FLARE_CAPA = False
 # required to not load not enabled dependencies
-if processing_conf.flare_capa.enabled and not processing_conf.flare_capa.on_demand:
+if integrations_conf.flare_capa.enabled and not integrations_conf.flare_capa.on_demand:
     from lib.cuckoo.common.integrations.capa import HAVE_FLARE_CAPA, flare_capa_details
 
 MISP_HASH_LOOKUP = False
@@ -113,7 +114,7 @@ class CAPE(Processing):
         elif type_strings[0] == "MS-DOS":
             file_info["cape_type"] = "DOS MZ image: executable"
         else:
-            file_info["cape_type"] = file_info["cape_type"] or "PE image"
+            file_info["cape_type"] = file_info["cape_type"] or "unknown"
         return append_file
 
     def _metadata_processing(self, metadata, file_info, append_file):
@@ -163,6 +164,7 @@ class CAPE(Processing):
         """
 
         if not path_exists(file_path):
+            log.debug("file doesn't exist: %s", file_path)
             return
 
         cape_names = set()
@@ -206,7 +208,7 @@ class CAPE(Processing):
 
         type_string, append_file = self._metadata_processing(metadata, file_info, append_file)
 
-        if processing_conf.CAPE.targetinfo and category in ("static", "file"):
+        if category in ("static", "file"):
             if MISP_HASH_LOOKUP:
                 misp_hash_lookup(file_info["sha256"], str(self.task["id"]), file_info)
 
@@ -244,7 +246,8 @@ class CAPE(Processing):
             if file_info.get("pid"):
                 _ = cape_name_from_yara(file_info, file_info["pid"], self.results)
 
-            if HAVE_FLARE_CAPA:
+            # ToDo https://github.com/mandiant/capa/issues/2620
+            if HAVE_FLARE_CAPA and ("PE32" in file_info["type"] or "MS-DOS executable" in file_info["type"]):
                 pretime = timeit.default_timer()
                 capa_details = flare_capa_details(file_path, "procdump")
                 if capa_details:
@@ -256,21 +259,22 @@ class CAPE(Processing):
         # Process CAPE Yara hits
         # Prefilter extracted data + beauty is better than oneliner:
         all_files = []
-        for extracted_file in file_info.get("extracted_files", []):
-            if not extracted_file["cape_yara"]:
-                continue
-            if extracted_file.get("data", b""):
-                extracted_file_data = make_bytes(extracted_file["data"])
-            else:
-                extracted_file_data = Path(extracted_file["path"]).read_bytes()
-            for yara in extracted_file["cape_yara"]:
-                all_files.append(
-                    (
-                        f"[{extracted_file.get('sha256', '')}]{file_info['path']}",
-                        extracted_file_data,
-                        yara,
+        for _, value in file_info.get("selfextract", {}).items():
+            for file in value.get("extracted_files", []):
+                if not file.get("cape_yara", []):
+                    continue
+                if file.get("data", b""):
+                    extracted_file_data = make_bytes(file["data"])
+                else:
+                    extracted_file_data = Path(file["path"]).read_bytes()
+                for yara in file["cape_yara"]:
+                    all_files.append(
+                        (
+                            f"[{file.get('sha256', '')}]{file_info['path']}",
+                            extracted_file_data,
+                            yara,
+                        )
                     )
-                )
 
         # Get the file data
         file_data = None
@@ -320,7 +324,8 @@ class CAPE(Processing):
                 append_file = is_duplicated_binary(file_info, cape_file, append_file)
 
         if append_file:
-            if HAVE_FLARE_CAPA and category == "CAPE":
+            # ToDo https://github.com/mandiant/capa/issues/2620
+            if HAVE_FLARE_CAPA and category == "CAPE" and ("PE32" in file_info["type"] or "MS-DOS executable" in file_info["type"]):
                 pretime = timeit.default_timer()
                 capa_details = flare_capa_details(file_path, "cape")
                 if capa_details:
@@ -337,7 +342,7 @@ class CAPE(Processing):
         """
         self._set_dict_keys()
         meta = {}
-        # Required to control files extracted by selfextract.conf as we store them in dropped
+        # Required to control files extracted by integrations.conf as we store them in dropped
         duplicated: DuplicatesType = collections.defaultdict(set)
         if path_exists(self.files_metadata):
             for line in open(self.files_metadata, "rb"):
@@ -386,18 +391,23 @@ class CAPE(Processing):
         # look for an existing config matching this cape_name; merge them if found
         for existing_config in self.cape["configs"]:
             if cape_name in existing_config:
-                log.debug("CAPE: data loss may occur, existing config found for: %s", cape_name)
+                log.debug("CAPE: existing config found for: %s, merging - data loss may occur", cape_name)
                 existing_config[cape_name].update(config[cape_name])
                 config = existing_config
-                break
-        else:
-            # first time a config for this cape_name was seen
-            log.debug("CAPE: new config found for: %s", cape_name)
-            self.cape["configs"].append(config)
+                self.link_configs_to_hashes(config, file_obj)
+                return
 
-        # Link the config to the hashes it was generated from.
-        # Store it in a list so that the keys of the dict are fixed and not dynamic, which, if
-        # storing the report in ElasticSearch, could otherwise create tons of keys in the index.
+        # first time a config for this cape_name was seen
+        log.debug("CAPE: new config found for: %s", cape_name)
+        self.cape["configs"].append(config)
+        self.link_configs_to_hashes(config, file_obj)
+
+
+    def link_configs_to_hashes(self, config, file_obj):
+        """Link the config to the hashes it was generated from.
+        Store it in a list so that the keys of the dict are fixed and not dynamic, which, if
+        storing the report in ElasticSearch, could otherwise create tons of keys in the index.
+        """
         sha256 = file_obj.get("sha256", "")
         current_hashes = config.setdefault("_associated_config_hashes", [])
         for hashes in current_hashes:

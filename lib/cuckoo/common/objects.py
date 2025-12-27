@@ -31,6 +31,7 @@ from lib.cuckoo.common.integrations.parse_pe import IMAGE_FILE_MACHINE_AMD64, IM
 from lib.cuckoo.common.path_utils import path_exists
 
 try:
+    # python-magic, not file-magic!
     import magic
 
     HAVE_MAGIC = True
@@ -74,13 +75,16 @@ except ImportError:
     print("Missed library. Run: poetry install")
     HAVE_YARA = False
 
+HAVE_YARA_X = False
+yara_x = False
+"""
 try:
     import yara_x
 
     HAVE_YARA_X = True
 except ImportError:
     # print("Missed library. Run: poetry install pip3 install yara-x")
-    HAVE_YARA_X = False
+"""
 
 log = logging.getLogger(__name__)
 
@@ -163,7 +167,8 @@ class URL:
 class File:
     """Basic file object class with all useful utilities."""
 
-    LINUX_TYPES = {"Bourne-Again", "POSIX shell script", "ELF", "Python"}
+    # ToDo python can be executed on windows too
+    LINUX_TYPES = {"Bourne-Again", "POSIX shell script", "ELF"}  # , "Python"
     DARWIN_TYPES = {"Mach-O"}
 
     # The yara rules should not change during one Cuckoo run and as such we're
@@ -338,18 +343,12 @@ class File:
         file_type = None
         if self.path_object.exists():
             if HAVE_MAGIC:
-                fn = False
-                if hasattr(magic, "detect_from_filename"):
-                    fn = magic.detect_from_filename
-                if hasattr(magic, "from_file"):
-                    fn = magic.from_file
-                if fn:
-                    try:
-                        file_type = fn(self.file_path_ansii)
-                    except magic.MagicException as e:
-                        log.error("Magic error: %s", str(e))
-                    except Exception as e:
-                        log.error(e, exc_info=True)
+                try:
+                    file_type = magic.from_file(self.file_path_ansii)
+                except magic.MagicException as e:
+                    log.error("Magic error: %s", str(e))
+                except Exception as e:
+                    log.exception(e)
                 if not file_type and hasattr(magic, "open"):
                     try:
                         ms = magic.open(magic.MAGIC_MIME | magic.MAGIC_SYMLINK)
@@ -357,7 +356,7 @@ class File:
                         file_type = ms.file(self.file_path)
                         ms.close()
                     except Exception as e:
-                        log.error(e, exc_info=True)
+                        log.exception(e)
 
             if file_type is None:
                 try:
@@ -366,7 +365,7 @@ class File:
                     )
                     file_type = p.stdout.read().strip()
                 except Exception as e:
-                    log.error(e, exc_info=True)
+                    log.exception(e)
 
         return file_type
 
@@ -415,7 +414,7 @@ class File:
                         File.notified_pefile = True
                         log.warning("Unable to import pefile (install with `pip3 install pefile`)")
             except Exception as e:
-                log.error(e, exc_info=True)
+                log.exception(e)
         if not self.file_type:
             self.file_type = self.get_content_type()
 
@@ -455,12 +454,15 @@ class File:
                     log.warning("Missing Yara directory: %s?", category_root)
                     continue
 
-                for filename in os.listdir(category_root):
-                    if not filename.endswith((".yar", ".yara")):
+                for category_root, _, filenames in os.walk(category_root, followlinks=True):
+                    if category_root.endswith("deprecated"):
                         continue
-                    filepath = os.path.join(category_root, filename)
-                    rules[f"rule_{category}_{len(rules)}"] = filepath
-                    indexed.append(filename)
+                    for filename in filenames:
+                        if not filename.endswith((".yar", ".yara")):
+                            continue
+                        filepath = os.path.join(category_root, filename)
+                        rules[f"rule_{category}_{len(rules)}"] = filepath
+                        indexed.append(filename)
 
                 # Need to define each external variable that will be used in the
             # future. Otherwise Yara will complain.
@@ -623,7 +625,10 @@ class File:
         """Return the part of the cape_type (e.g. "SocGholish Payload") preceding
         " Payload", " Config", " Loader", or " Strings"
         """
-        return cls.cape_name_regex.sub("", cape_type)
+        if bool(cls.cape_name_regex.search(cape_type)):
+            return cls.cape_name_regex.sub("", cape_type)
+        else:
+            return ""
 
     def get_tlsh(self):
         """
@@ -729,6 +734,7 @@ class File:
         retval = "windows"
         ftype = self.get_type()
         if isinstance(ftype, str):
+            # ToDo check if linux enabled
             if any(x in ftype for x in File.LINUX_TYPES):
                 retval = "linux"
             elif any(x in ftype for x in File.DARWIN_TYPES):
@@ -790,7 +796,7 @@ class ProcDump:
         if prot & PAGE_GUARD:
             return "G"
         prot &= 0xFF
-        return self.protmap[prot]
+        return self.protmap.get(prot, "UNKNOWN")
 
     def pretty_print(self):
         new_addr_space = copy.deepcopy(self.address_space)

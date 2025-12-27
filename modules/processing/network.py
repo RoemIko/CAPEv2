@@ -168,6 +168,8 @@ class Pcap:
         self.ja3_fprints = ja3_fprints
         self.options = options
 
+        self.ip_n_ports = {}
+
         # List of all hosts.
         self.hosts = []
         # List containing all non-private IP addresses.
@@ -306,6 +308,7 @@ class Pcap:
                     # first packet they appear in.
                     if not self._is_private_ip(ip):
                         self.unique_hosts.append(ip)
+                        self.ip_n_ports.setdefault(ip, []).append(connection["dport"])
 
     def _enrich_hosts(self, unique_hosts):
         enriched_hosts = []
@@ -338,6 +341,7 @@ class Pcap:
                     "asn_name": asn_name,
                     "hostname": hostname,
                     "inaddrarpa": inaddrarpa,
+                    "ports": self.ip_n_ports.get(ip, []),
                 }
             )
         return enriched_hosts
@@ -531,6 +535,7 @@ class Pcap:
         """Add a domain to unique list.
         @param domain: domain name.
         """
+        # ToDo global filter here right?
         filters = (".*\\.windows\\.com$", ".*\\.in\\-addr\\.arpa$", ".*\\.ip6\\.arpa$")
 
         regexps = [re.compile(filter) for filter in filters]
@@ -771,8 +776,6 @@ class Pcap:
                     offset = file.tell()
                     continue
 
-                self._add_hosts(connection)
-
                 if ip.p == dpkt.ip.IP_PROTO_TCP:
                     tcp = ip.data
                     if not isinstance(tcp, dpkt.tcp.TCP):
@@ -783,6 +786,10 @@ class Pcap:
 
                     connection["sport"] = tcp.sport
                     connection["dport"] = tcp.dport
+
+                    if tcp.flags & dpkt.tcp.TH_SYN and tcp.flags & dpkt.tcp.TH_ACK:
+                        connection["src"], connection["dst"] = connection["dst"], connection["src"]
+                        connection["sport"], connection["dport"] = connection["dport"], connection["sport"]
 
                     if tcp.data:
                         self._tcp_dissect(connection, tcp.data, ts)
@@ -834,6 +841,7 @@ class Pcap:
                     self._icmp_dissect(connection, icmp)
 
                 offset = file.tell()
+                self._add_hosts(connection)
             except AttributeError:
                 continue
             except dpkt.dpkt.NeedData:
@@ -1080,6 +1088,8 @@ class Pcap2:
 class NetworkAnalysis(Processing):
     """Network analysis."""
 
+    key = "network"
+
     # ToDo map this to suricata.tls.ja
     def _import_ja3_fprints(self):
         """
@@ -1101,7 +1111,6 @@ class NetworkAnalysis(Processing):
         return ja3_fprints
 
     def run(self):
-
         if not path_exists(self.pcap_path):
             log.debug('The PCAP file does not exist at path "%s"', self.pcap_path)
             return {}
@@ -1134,11 +1143,9 @@ class NetworkAnalysis(Processing):
 
         if HAVE_HTTPREPLAY:
             try:
-                p2 = {}
                 tls_master = self.get_tlsmaster()
-                if tls_master:
-                    p2 = Pcap2(self.pcap_path, tls_master, self.network_path).run()
-                if p2:
+                p2 = Pcap2(self.pcap_path, tls_master, self.network_path).run()
+                if any(p2.values()):
                     results.update(p2)
             except Exception:
                 log.exception("Error running httpreplay-based PCAP analysis")

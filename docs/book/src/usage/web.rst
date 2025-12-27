@@ -90,7 +90,7 @@ To extend the capabilities of control what users can do check `Django migrations
 
 .. _`Django migrations a primer`: https://realpython.com/django-migrations-a-primer/
 
-In few works you need to add new fields to ``models.py`` and run ``poetry run python3 manage.py makemigrations``
+In few words you need to add new fields to ``models.py`` and run ``poetry run python3 manage.py makemigrations``
 
 
 Exposed to internet
@@ -99,7 +99,7 @@ Exposed to internet
 To get rid of many bots/scrappers so we suggest deploying this amazing project `Nginx Ultimate bad bot blocker`_, follow the README for installation steps
 
 * Enable web auth with captcha in `conf/web.conf` properly to avoid any brute force.
-* Enable `ReCaptcha`_. You will need to set ``Public`` and ``Secret`` keys in ``web/web/settings.py``
+* Enable `ReCaptcha`_. You will need to set ``RECAPTCHA_PUBLIC_KEY`` and ``RECAPTCHA_PRIVATE_KEY`` keys in ``web/web/local_settings.py``
 * You might need to "Verify" and set as "Stuff user" to your admin in the Django admin panel and add your domain to Sites in Django admin too
 * `AllAuth`_ aka SSO authentication with Google, Github, etc. `Video Tutorial`_ & `StackOverflow Example`_:
     * Note ``SITE_ID=1`` in django admin is ``example.com`` rename it to your domain to get it working
@@ -132,8 +132,8 @@ Run
 
 .. code:: bash
 
-   sudo systemctl daemon-reload
-   sudo service cape-web restart
+    sudo systemctl daemon-reload
+    sudo service cape-web restart
 
 NGINX
 -----
@@ -141,9 +141,10 @@ Next, install NGINX and configure it to be a reverse proxy to Gunicorn.
 
 .. code:: bash
 
-   sudo apt install nginx
+    sudo apt install nginx
 
-Create a configuration file at ``/etc/nginx/conf.d/cape``
+Create a configuration file at ``/etc/nginx/conf.d/cape``.
+You might need to add ``include /etc/nginx/conf.d/*.conf;`` to ``http`` section inside of ``/etc/nginx/nginx.conf``.
 
 Replace ``www.capesandbox.com`` with your actual hostname.
 
@@ -159,14 +160,14 @@ Replace ``www.capesandbox.com`` with your actual hostname.
 
 
         location ^~ /.well-known/acme-challenge/ {
-          default_type "text/plain";
-          root         /var/www/html;
-          break;
-      }
+            default_type "text/plain";
+            root         /var/www/html;
+            break;
+        }
 
-      location = /.well-known/acme-challenge/ {
-        return 404;
-      }
+        location = /.well-known/acme-challenge/ {
+            return 404;
+        }
 
         location / {
             proxy_pass http://127.0.0.1:8000;
@@ -210,8 +211,8 @@ Now enable the nginx configuration by executing the following:
 
 .. code:: bash
 
-   rm -f /etc/nginx/conf.d/default
-   ln -s /etc/nginx/conf.d/cape /etc/nginx/conf.d/default
+    rm -f /etc/nginx/conf.d/default
+    ln -s /etc/nginx/conf.d/cape /etc/nginx/conf.d/default
 
 
 If you want to block users from changing their own email addresses, add the following `location` directive inside of the `server` directive:
@@ -287,15 +288,14 @@ Let's Encrypt certificates
 
 If you would like to install a free Let's Encrypt certificate on your NGINX
 server, follow these steps, replacing ``capesandbox.com`` with your actual
-hostname.
+hostname. Use ``cape2.sh`` to install dependencies. But also ensure that instruction
+are up to date with this https://certbot.eff.org/
 
 Install `certbot`.
 
 .. code-block:: bash
 
-    sudo snap install core; sudo snap refresh core
-    sudo snap install --classic certbot
-    sudo ln -s /snap/bin/certbot /usr/bin/certbot
+    sudo cape2.sh letsencrypt
 
 Request the certificate
 
@@ -474,3 +474,44 @@ an error like ``django.db.utils.OperationalError: no such table: auth_user``
 may be raised. In order to solve it just execute the ``web/manage.py`` utility with the ``migrate`` option::
 
 $ sudo -u cape poetry run python3 web/manage.py migrate
+
+
+Slow web/API searches when using MongoDB as backend
+---------------------------------------------------
+
+* Check server lack of resources as memory ram, cpu or even slow hard drive.
+* Possible issue is the lack of proper indexes.
+* List your MongoDB indexes:
+
+.. code-block:: bash
+
+    db.analysis.getIndexes()
+
+* Test your query with explaination. Replace with your search patterns:
+
+.. code-block:: bash
+
+        db.analysis.find({"target.file.name": "<name>"}).explain("executionStats")
+
+* Pay attention to stage value:
+
+.. code-block:: bash
+
+    executionStages: {
+        stage: 'COLLSCAN', # <--- Full collection scan instead of index usage
+
+If you expect it to search in index, expected output should be like this:
+
+.. code-block:: bash
+
+    executionStages: {
+        stage: 'FETCH',
+        <stripped>
+        inputStage: {
+            stage: 'IXSCAN', # <--- Index usage
+
+* How to delete index
+
+.. code-block:: bash
+
+    db.collection.dropIndexes("<index name>")
