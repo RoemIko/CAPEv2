@@ -21,7 +21,10 @@ from lib.cuckoo.common.integrations.parse_pe import PortableExecutable
 from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.utils import convert_to_printable, create_folder, get_memdump_path
-from lib.cuckoo.core.database import TASK_COMPLETED, TASK_PENDING, TASK_RUNNING, Database, Guest, Machine, Task, _Database
+from lib.cuckoo.core.database import Database, _Database
+from lib.cuckoo.core.data.task import TASK_COMPLETED, TASK_PENDING, TASK_RUNNING, TASK_FAILED_ANALYSIS, Task
+from lib.cuckoo.core.data.machines import Machine
+from lib.cuckoo.core.data.guests import Guest
 from lib.cuckoo.core.guest import GuestManager
 from lib.cuckoo.core.machinery_manager import MachineryManager
 from lib.cuckoo.core.plugins import RunAuxiliary
@@ -257,7 +260,8 @@ class AnalysisManager(threading.Thread):
             options["file_name"] = file_obj.get_name()
             options["file_type"] = file_obj.get_type()
             # if it's a PE file, collect export information to use in more smartly determining the right package to use
-            options["exports"] = PortableExecutable(self.task.target).get_dll_exports()
+            with PortableExecutable(self.task.target) as pe:
+                options["exports"] = pe.get_dll_exports()
             del file_obj
 
         # options from auxiliary.conf
@@ -305,6 +309,7 @@ class AnalysisManager(threading.Thread):
     def machine_running(self) -> Generator[None, None, None]:
         assert self.machinery_manager and self.machine and self.guest
 
+        is_dead = False
         try:
             with self.db.session.begin():
                 self.machinery_manager.start_machine(self.machine)
@@ -315,6 +320,7 @@ class AnalysisManager(threading.Thread):
             self.dump_machine_memory()
 
         except (CuckooMachineError, CuckooGuestCriticalTimeout) as e:
+            is_dead = True
             # This machine has turned dead, so we'll throw an exception
             # which informs the AnalysisManager that it should analyze
             # this task again with another available machine.
@@ -333,25 +339,24 @@ class AnalysisManager(threading.Thread):
             shutil.rmtree(self.storage)
 
             raise CuckooDeadMachine(self.machine.name) from e
+        finally:
+            if not is_dead:
+                try:
+                    with self.db.session.begin():
+                        self.machinery_manager.stop_machine(self.machine)
+                except CuckooMachineError as e:
+                    self.log.warning("Unable to stop machine %s: %s", self.machine.label, e)
 
-        with self.db.session.begin():
-            try:
-                self.machinery_manager.stop_machine(self.machine)
-            except CuckooMachineError as e:
-                self.log.warning("Unable to stop machine %s: %s", self.machine.label, e)
-                # Explicitly rollback since we don't re-raise the exception.
-                self.db.session.rollback()
-
-        try:
-            # Release the analysis machine, but only if the machine is not dead.
-            with self.db.session.begin():
-                self.machinery_manager.machinery.release(self.machine)
-        except CuckooMachineError as e:
-            self.log.error(
-                "Unable to release machine %s, reason %s. You might need to restore it manually",
-                self.machine.label,
-                e,
-            )
+                try:
+                    # Release the analysis machine, but only if the machine is not dead.
+                    with self.db.session.begin():
+                        self.machinery_manager.machinery.release(self.machine)
+                except CuckooMachineError as e:
+                    self.log.error(
+                        "Unable to release machine %s, reason %s. You might need to restore it manually",
+                        self.machine.label,
+                        e,
+                    )
 
     def dump_machine_memory(self) -> None:
         if not self.cfg.cuckoo.memory_dump and not self.task.memory:
@@ -422,7 +427,6 @@ class AnalysisManager(threading.Thread):
             options["clock"] = self.db.update_clock(self.task.id)
             self.db.guest_set_status(self.task.id, "starting")
         guest_manager.start_analysis(options)
-
         try:
             if guest_manager.get_status_from_db() == "starting":
                 guest_manager.set_status_in_db("running")
@@ -478,6 +482,13 @@ class AnalysisManager(threading.Thread):
             with self.db.session.begin():
                 # Put the task back in pending so that the schedule can attempt to choose a new machine.
                 self.db.set_status(self.task.id, TASK_PENDING)
+            raise
+        except Exception as e:
+            self.log.exception("Unexpected exception during analysis: %s", e)
+            with self.db.session.begin():
+                self.db.set_status(self.task.id, TASK_FAILED_ANALYSIS)
+                if hasattr(self, "machine") and self.machine:
+                    self.db.unlock_machine(self.machine)
             raise
         else:
             with self.db.session.begin():
@@ -544,7 +555,7 @@ class AnalysisManager(threading.Thread):
         elif self.route == "internet" and routing.routing.internet != "none":
             self.interface = routing.routing.internet
             self.rt_table = routing.routing.rt_table
-            self.no_local_routing = routing.routing.no_local_routing
+            self.no_local_routing = routing.routing.no_local_routing and not routing.routing.nat
             if routing.routing.reject_segments != "none":
                 self.reject_segments = routing.routing.reject_segments
             if routing.routing.reject_hostports != "none":
@@ -580,7 +591,7 @@ class AnalysisManager(threading.Thread):
                 self.machine.ip,
                 str(routing.inetsim.server),
                 str(routing.inetsim.dnsport),
-                str(self.cfg.resultserver.port),
+                str(self.machine.resultserver_port),
                 str(routing.inetsim.ports),
             )
 
@@ -588,7 +599,7 @@ class AnalysisManager(threading.Thread):
             self.rooter_response = rooter(
                 "socks5_enable",
                 self.machine.ip,
-                str(self.cfg.resultserver.port),
+                str(self.machine.resultserver_port),
                 str(routing.tor.dnsport),
                 str(routing.tor.proxyport),
             )
@@ -597,13 +608,14 @@ class AnalysisManager(threading.Thread):
             self.rooter_response = rooter(
                 "socks5_enable",
                 self.machine.ip,
-                str(self.cfg.resultserver.port),
+                str(self.machine.resultserver_port),
                 str(self.socks5s[self.route]["dnsport"]),
                 str(self.socks5s[self.route]["port"]),
             )
+            self.rooter_response = rooter("libvirt_fwo_enable", self.machine.interface, self.machine.ip)
 
-        elif self.route in ("none", "None", "drop"):
-            self.rooter_response = rooter("drop_enable", self.machine.ip, str(self.cfg.resultserver.port))
+        elif str(self.route).lower() in ("none", "drop", "false"):
+            self.rooter_response = rooter("drop_enable", self.machine.ip, str(self.machine.resultserver_port))
         elif self.route[:3] == "tun" and is_network_interface(self.route):
             self.log.info("Network interface %s is tunnel", self.interface)
             self.rooter_response = rooter("interface_route_tun_enable", self.machine.ip, self.route, str(self.task.id))
@@ -618,6 +630,7 @@ class AnalysisManager(threading.Thread):
             self.route = "drop"
 
         if self.interface:
+            self.rooter_response = rooter("libvirt_fwo_enable", self.machine.interface, self.machine.ip)
             if self.no_local_routing:
                 input_interface = "dirty-line"
                 # Traffic from lan to machine
@@ -643,7 +656,7 @@ class AnalysisManager(threading.Thread):
                     self.machine.ip,
                     self.cfg.resultserver.ip,
                     "tcp",
-                    str(self.cfg.resultserver.port),
+                    str(self.machine.resultserver_port),
                 )
                 self.rooter_response = rooter(
                     "forward_enable", input_interface, self.machine.interface, self.cfg.resultserver.ip, self.machine.ip
@@ -666,6 +679,7 @@ class AnalysisManager(threading.Thread):
     def unroute_network(self):
         routing = Config("routing")
         if self.interface:
+            self.rooter_response = rooter("libvirt_fwo_disable", self.machine.interface, self.machine.ip)
             if self.no_local_routing:
                 input_interface = "dirty-line"
                 # Traffic from lan to machine
@@ -690,7 +704,7 @@ class AnalysisManager(threading.Thread):
                     self.machine.ip,
                     self.cfg.resultserver.ip,
                     "tcp",
-                    str(self.cfg.resultserver.port),
+                    str(self.machine.resultserver_port),
                 )
                 self.rooter_response = rooter(
                     "forward_disable", input_interface, self.machine.interface, self.cfg.resultserver.ip, self.machine.ip
@@ -714,7 +728,7 @@ class AnalysisManager(threading.Thread):
                 self.machine.ip,
                 routing.inetsim.server,
                 str(routing.inetsim.dnsport),
-                str(self.cfg.resultserver.port),
+                str(self.machine.resultserver_port),
                 str(routing.inetsim.ports),
             )
 
@@ -722,7 +736,7 @@ class AnalysisManager(threading.Thread):
             self.rooter_response = rooter(
                 "socks5_disable",
                 self.machine.ip,
-                str(self.cfg.resultserver.port),
+                str(self.machine.resultserver_port),
                 str(routing.tor.dnsport),
                 str(routing.tor.proxyport),
             )
@@ -731,13 +745,14 @@ class AnalysisManager(threading.Thread):
             self.rooter_response = rooter(
                 "socks5_disable",
                 self.machine.ip,
-                str(self.cfg.resultserver.port),
+                str(self.machine.resultserver_port),
                 str(self.socks5s[self.route]["dnsport"]),
                 str(self.socks5s[self.route]["port"]),
             )
+            self.rooter_response = rooter("libvirt_fwo_disable", self.machine.interface, self.machine.ip)
 
-        elif self.route in ("none", "None", "drop"):
-            self.rooter_response = rooter("drop_disable", self.machine.ip, str(self.cfg.resultserver.port))
+        elif str(self.route).lower() in ("none", "drop", "false"):
+            self.rooter_response = rooter("drop_disable", self.machine.ip, str(self.machine.resultserver_port))
         elif self.route[:3] == "tun":
             self.log.info("Disable tunnel interface: %s", self.interface)
             self.rooter_response = rooter("interface_route_tun_disable", self.machine.ip, self.route, str(self.task.id))

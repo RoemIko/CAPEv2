@@ -56,6 +56,12 @@ disable_warnings()
 
 logger = logging.getLogger(__name__)
 
+allowed_functions = {
+    "sorted": sorted,
+    "set": set,
+    "os.path.join": os.path.join,
+}
+
 
 def parse_expr(expr, context):
     """Return the value from a python AST expression.
@@ -88,11 +94,10 @@ def parse_expr(expr, context):
         # Figure out what function is being called, with what arguments.
         func = parse_expr(expr.func, context)
         args = tuple([parse_expr(item, context) for item in expr.args])
-        # We deem these functions safe to use with "eval".
-        allowed_functions = ("sorted", "set", "os.path.join")
+
         if func in allowed_functions:
             # Actually call the function, passing the args, and return the result.
-            return eval(f"{func}{args}")
+            return allowed_functions[func](*args)
         # Don't execute the call, but instead, give back a string representation.
         return f"<{func}{args}>"
     if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
@@ -352,6 +357,9 @@ def index(request, task_id=None, resubmit_hash=None):
         if request.POST.get("unpack"):
             options += "unpack=yes,"
 
+        if request.POST.get("screenshots_qr"):
+            options += "screenshots_qr=yes,"
+
         job_category = False
         if request.POST.get("job_category"):
             job_category = request.POST.get("job_category")
@@ -383,6 +391,19 @@ def index(request, task_id=None, resubmit_hash=None):
         }
         if opt_apikey:
             details["apikey"] = opt_apikey
+
+        if web_conf.pre_script.enabled and "pre_script" in request.FILES:
+            pre_script = request.FILES["pre_script"]
+            details["pre_script_name"] = pre_script.name
+            details["pre_script_content"] = pre_script.read()
+            pre_script.close()
+
+        if web_conf.during_script.enabled and "during_script" in request.FILES:
+            during_script = request.FILES["during_script"]
+            details["during_script_name"] = during_script.name
+            details["during_script_content"] = during_script.read()
+            during_script.close()
+
         task_category = False
         samples = []
         if "hash" in request.POST and request.POST.get("hash", False) and request.POST.get("hash")[0] != "":
@@ -410,7 +431,8 @@ def index(request, task_id=None, resubmit_hash=None):
         if task_category in ("url", "dlnexec"):
             if not samples:
                 return render(request, "error.html", {"error": "You specified an invalid URL!"})
-            for url in samples.split(web_conf.general.url_splitter):
+            urls = [u.strip() for u in samples.split(web_conf.general.url_splitter) if u.strip()] if web_conf.general.url_splitter else [samples]
+            for url in urls:
                 url = url.replace("hxxps://", "https://").replace("hxxp://", "http://").replace("[.]", ".")
                 if task_category == "dlnexec":
                     path, content, sha256 = process_new_dlnexec_task(url, route, options, custom)
@@ -475,7 +497,13 @@ def index(request, task_id=None, resubmit_hash=None):
                 if opt_filename:
                     filename = base_dir + "/" + opt_filename
                 else:
-                    filename = base_dir + "/" + sanitize_filename(hash)
+                    # Try to recover the original filename from the task
+                    original_filename = ""
+                    if task_id:
+                        task = db.view_task(task_id)
+                        if task and task.target:
+                            original_filename = sanitize_filename(os.path.basename(task.target))
+                    filename = base_dir + "/" + (original_filename or sanitize_filename(hash))
                 path = store_temp_file(content, filename)
                 list_of_tasks.append((content, path, hash))
 
@@ -485,16 +513,6 @@ def index(request, task_id=None, resubmit_hash=None):
 
         if task_category == "resubmit":
             for content, path, sha256 in list_of_tasks:
-                if web_conf.pre_script.enabled and "pre_script" in request.FILES:
-                    pre_script = request.FILES["pre_script"]
-                    details["pre_script_name"] = request.FILES["pre_script"].name
-                    details["pre_script_content"] = pre_script.read()
-
-                if web_conf.during_script.enabled and "during_script" in request.FILES:
-                    during_script = request.FILES["during_script"]
-                    details["during_script_name"] = request.FILES["during_script"].name
-                    details["during_script_content"] = during_script.read()
-
                 details["path"] = path
                 details["content"] = content
                 status, tasks_details = download_file(**details)
@@ -513,16 +531,6 @@ def index(request, task_id=None, resubmit_hash=None):
         elif task_category == "sample":
             details["service"] = "WebGUI"
             for content, path, sha256 in list_of_tasks:
-                if web_conf.pre_script.enabled and "pre_script" in request.FILES:
-                    pre_script = request.FILES["pre_script"]
-                    details["pre_script_name"] = request.FILES["pre_script"].name
-                    details["pre_script_content"] = pre_script.read()
-
-                if web_conf.during_script.enabled and "during_script" in request.FILES:
-                    during_script = request.FILES["during_script"]
-                    details["during_script_name"] = request.FILES["during_script"].name
-                    details["during_script_content"] = during_script.read()
-
                 if timeout and web_conf.public.enabled and web_conf.public.timeout and timeout > web_conf.public.timeout:
                     timeout = web_conf.public.timeout
 

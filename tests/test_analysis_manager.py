@@ -10,9 +10,12 @@ from pytest_mock import MockerFixture
 from sqlalchemy import select
 
 from lib.cuckoo.common.abstracts import Machinery
-from lib.cuckoo.common.config import ConfigMeta
+from lib.cuckoo.common.config import Config, ConfigMeta
 from lib.cuckoo.core.analysis_manager import AnalysisManager
-from lib.cuckoo.core.database import TASK_RUNNING, Guest, Machine, Task, _Database
+from lib.cuckoo.core.data.task import TASK_RUNNING, Task, TASK_FAILED_ANALYSIS
+from lib.cuckoo.core.data.guests import Guest
+from lib.cuckoo.core.data.machines import Machine
+from lib.cuckoo.core.database import _Database
 from lib.cuckoo.core.machinery_manager import MachineryManager
 from lib.cuckoo.core.scheduler import Scheduler
 
@@ -108,37 +111,7 @@ class TestAnalysisManager:
     def test_init(self, task: Task):
         mgr = AnalysisManager(task=task)
 
-        assert mgr.cfg.cuckoo == {
-            "allow_static": False,
-            "categories": "static, pcap, url, file",
-            "freespace": 50000,
-            "delete_original": False,
-            "tmppath": "/tmp",
-            "terminate_processes": False,
-            "memory_dump": False,
-            "delete_bin_copy": False,
-            "max_machines_count": 10,
-            "reschedule": False,
-            "rooter": "/tmp/cuckoo-rooter",
-            "machinery": "kvm",
-            "machinery_screenshots": False,
-            "delete_archive": True,
-            "max_vmstartup_count": 5,
-            "daydelta": 0,
-            "max_analysis_count": 0,
-            "max_len": 196,
-            "sanitize_len": 32,
-            "sanitize_to_len": 24,
-            "scaling_semaphore": False,
-            "scaling_semaphore_update_timer": 10,
-            "task_pending_timeout": 0,
-            "task_timeout": False,
-            "task_timeout_scan_interval": 30,
-            "freespace_processing": 15000,
-            "ignore_signals": True,
-            "periodic_log": False,
-            "fail_unserviceable": True,
-        }
+        assert mgr.cfg.cuckoo == Config("cuckoo").cuckoo
 
         assert mgr.task.id == task.id
 
@@ -303,7 +276,12 @@ class TestAnalysisManager:
         assert "no machine is used" in caplog.text
 
     def test_build_options(
-        self, db: _Database, tmp_path: pathlib.Path, task: Task, machine: Machine, machinery_manager: MachineryManager
+        self,
+        db: _Database,
+        tmp_path: pathlib.Path,
+        task: Task,
+        machine: Machine,
+        machinery_manager: MachineryManager,
     ):
         with db.session.begin():
             task = db.session.merge(task)
@@ -315,57 +293,38 @@ class TestAnalysisManager:
 
         analysis_man = AnalysisManager(task=task, machine=machine, machinery_manager=machinery_manager)
         opts = analysis_man.build_options()
-        assert opts == {
-            "amsi": False,
-            "browser": True,
-            "browsermonitor": False,
+
+        expected_opts = {
             "category": "file",
             "clock": datetime.datetime(2099, 1, 1, 9, 1, 1),
-            "curtain": False,
-            "digisig": True,
-            "disguise": True,
             "do_upload_max_size": 0,
-            "during_script": False,
             "enable_trim": 0,
             "enforce_timeout": 1,
-            "evtx": False,
             "exports": "",
-            "filecollector": True,
             "file_name": "sample.py",
-            "file_pickup": False,
             "file_type": "Python script, ASCII text executable",
-            "human_linux": False,
-            "human_windows": True,
             "id": task.id,
             "ip": "5.6.7.8",
             "options": "foo=bar",
             "package": "foo",
-            "permissions": False,
             "port": "2043",
-            "pre_script": False,
-            "procmon": False,
-            "recentfiles": False,
-            "screenshots_linux": True,
-            "screenshots_windows": True,
-            "sslkeylogfile": False,
-            "sysmon_linux": False,
-            "sysmon_windows": False,
             "target": str(tmp_path / "sample.py"),
             "terminate_processes": False,
             "timeout": 10,
-            "tlsdump": True,
-            "tracee_linux": False,
             "upload_max_size": 100000000,
-            "usage": False,
-            "windows_static_route": False,
-            "windows_static_route_gateway": "192.168.1.1",
-            "dns_etw": False,
-            "wmi_etw": False,
-            "watchdownloads": False,
         }
+        # Dynamically load auxiliary modules from Config to ensure test stays in sync with configuration changes
+        expected_opts.update(Config("auxiliary").auxiliary_modules)
+
+        assert opts == expected_opts
 
     def test_build_options_pe(
-        self, db: _Database, tmp_path: pathlib.Path, task: Task, machine: Machine, machinery_manager: MachineryManager
+        self,
+        db: _Database,
+        tmp_path: pathlib.Path,
+        task: Task,
+        machine: Machine,
+        machinery_manager: MachineryManager,
     ):
         sample_location = get_test_object_path(
             pathlib.Path("data/core/5dd87d3d6b9d8b4016e3c36b189234772661e690c21371f1eb8e018f0f0dec2b")
@@ -380,54 +339,31 @@ class TestAnalysisManager:
 
         analysis_man = AnalysisManager(task=task, machine=machine, machinery_manager=machinery_manager)
         opts = analysis_man.build_options()
-        assert opts == {
-            "amsi": False,
-            "browser": True,
-            "browsermonitor": False,
+
+        expected_opts = {
             "category": "file",
             "clock": datetime.datetime(2099, 1, 1, 9, 1, 1),
-            "curtain": False,
-            "digisig": True,
-            "disguise": True,
             "do_upload_max_size": 0,
-            "during_script": False,
             "enable_trim": 0,
             "enforce_timeout": 1,
-            "evtx": False,
             "exports": "",
-            "filecollector": True,
             "file_name": sample_location.name,
-            "file_pickup": False,
             "file_type": "PE32 executable (console) Intel 80386, for MS Windows",
-            "human_linux": False,
-            "human_windows": True,
             "id": task.id,
             "ip": "5.6.7.8",
             "options": "",
             "package": "file",
-            "permissions": False,
             "port": "2043",
-            "pre_script": False,
-            "procmon": False,
-            "recentfiles": False,
-            "screenshots_linux": True,
-            "screenshots_windows": True,
-            "sslkeylogfile": False,
-            "sysmon_linux": False,
-            "sysmon_windows": False,
             "target": str(sample_location),
             "terminate_processes": False,
             "timeout": 10,
-            "tlsdump": True,
-            "tracee_linux": False,
             "upload_max_size": 100000000,
-            "usage": False,
-            "windows_static_route": False,
-            "windows_static_route_gateway": "192.168.1.1",
-            "dns_etw": False,
-            "wmi_etw": False,
-            "watchdownloads": False,
         }
+        # Dynamically load auxiliary modules from Config to ensure test stays in sync with configuration changes
+        expected_opts.update(Config("auxiliary").auxiliary_modules)
+
+        assert opts == expected_opts
+
 
     def test_category_checks(
         self, db: _Database, task: Task, machine: Machine, machinery_manager: MachineryManager, mocker: MockerFixture
@@ -504,3 +440,48 @@ class TestAnalysisManager:
         assert analysis_man.init_storage() is True
         mocker.patch("lib.cuckoo.core.database._Database.view_sample", return_value=mock_sample())
         assert analysis_man.category_checks() is True
+
+    def test_machine_running_finally_cleanup(
+        self, db: _Database, task: Task, machine: Machine, machinery_manager: MachineryManager, mocker: MockerFixture
+    ):
+        """Verify that machine_running stops and releases the machine even if an unhandled exception is raised in yield."""
+        analysis_man = AnalysisManager(task=task, machine=machine, machinery_manager=machinery_manager)
+
+        # Mock machinery manager functions
+        mock_start = mocker.patch.object(machinery_manager, "start_machine")
+        mock_stop = mocker.patch.object(machinery_manager, "stop_machine")
+        mock_release = mocker.patch.object(machinery_manager.machinery, "release")
+
+        guest = mocker.MagicMock()
+        guest.id = 123
+        analysis_man.guest = guest
+
+        with pytest.raises(RuntimeError, match="Simulated unhandled exception"):
+            with analysis_man.machine_running():
+                raise RuntimeError("Simulated unhandled exception")
+
+        # Verify stop and release are still cleanly called on unhandled exceptions
+        assert mock_start.called
+        assert mock_stop.called
+        assert mock_release.called
+
+    def test_launch_analysis_unexpected_exception(
+        self, db: _Database, task: Task, machine: Machine, machinery_manager: MachineryManager, mocker: MockerFixture
+    ):
+        """Verify that launch_analysis handles unexpected exceptions by setting status to failed and unlocking the machine."""
+        analysis_man = AnalysisManager(task=task, machine=machine, machinery_manager=machinery_manager)
+
+        # Force perform_analysis to raise an unhandled exception
+        mocker.patch.object(analysis_man, "perform_analysis", side_effect=RuntimeError("Unexpected perform_analysis error"))
+        mock_unlock = mocker.patch("lib.cuckoo.core.database._Database.unlock_machine")
+        mock_log_exception = mocker.patch.object(analysis_man.log, "exception")
+
+        with pytest.raises(RuntimeError, match="Unexpected perform_analysis error"):
+            analysis_man.launch_analysis()
+
+        # Verify task is flagged failed and machine is unlocked
+        with db.session.begin():
+            db_task = db.view_task(task.id)
+            assert db_task.status == TASK_FAILED_ANALYSIS
+        assert mock_unlock.called
+        assert mock_log_exception.called

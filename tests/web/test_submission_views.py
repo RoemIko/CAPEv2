@@ -60,7 +60,10 @@ class TestSubmissionViews(SimpleTestCase):
         submission_page = self.client.get("/submit/#file")
         self.assertIsNotNone(submission_page.content)
         self.assertIn("Analysis Package", submission_page.content.decode())
-        pattern = re.compile(r'select class="form-control" id="form_package" name="package">(.*?)</select>', flags=re.DOTALL)
+        pattern = re.compile(
+            r'<select(?=[^>]*\bid="form_package")(?=[^>]*\bname="package")(?=[^>]*\bclass="[^"]*form-select)[^>]*>(.*?)</select>',
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         matches = re.findall(pattern, submission_page.content.decode())
         self.assertEqual(len(matches), 1)
         group0 = matches[0].strip()
@@ -178,7 +181,7 @@ class TestSubmissionViews(SimpleTestCase):
         actual = get_lib_common_constants(platform="windows")
         self.assertIsInstance(actual, dict)
         self.assertEqual("runasx86", actual["OPT_RUNASX86"])
-        self.assertCountEqual(("file", "password"), actual["ARCHIVE_OPTIONS"])
+        self.assertCountEqual(("file", "password", "recursion_depth"), actual["ARCHIVE_OPTIONS"])
         self.assertCountEqual(("arguments", "dllloader", "function"), actual["DLL_OPTIONS"])
         self.assertIn("SystemDrive", actual["TRUSTED_PATH_TEXT"])
         self.assertIn("SystemDrive", actual["MSOFFICE_TRUSTED_PATH"])

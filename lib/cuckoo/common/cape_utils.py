@@ -122,13 +122,13 @@ def hash_file(method, path: str) -> str:
     @param path: file path
     @return: computed hash string
     """
-    f = open(path, "rb")
     h = method()
-    while True:
-        buf = f.read(BUFSIZE)
-        if not buf:
-            break
-        h.update(buf)
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(BUFSIZE)
+            if not buf:
+                break
+            h.update(buf)
     return h.hexdigest()
 
 
@@ -199,7 +199,7 @@ def static_config_parsers(cape_name: str, file_path: str, file_data: bytes) -> d
     # MalDuck
     # Attempt to import a parser for the hit
     if HAVE_CAPE_EXTRACTORS and cape_name in cape_malware_parsers:
-        log.debug("Running CAPE on %s", file_path)
+        log.debug("Running CAPE parser for %s on %s", cape_name, file_path)
         try:
             # changed from cape_config to cape_configraw because of avoiding overridden. duplicated value name.
             if hasattr(cape_malware_parsers[cape_name], "extract_config"):
@@ -225,7 +225,7 @@ def static_config_parsers(cape_name: str, file_path: str, file_data: bytes) -> d
 
     # DC3-MWCP
     if HAS_MWCP and not parser_loaded and cape_name and cape_name in mwcp_decoders:
-        log.debug("Running MWCP on %s", file_path)
+        log.debug("Running MWCP parser for %s on %s", cape_name, file_path)
         try:
             report = mwcp.run(mwcp_decoders[cape_name], data=file_data)
             reportmeta = report.as_dict_legacy()
@@ -260,7 +260,7 @@ def static_config_parsers(cape_name: str, file_path: str, file_data: bytes) -> d
             )
 
     elif HAS_MALWARECONFIGS and not parser_loaded and cape_name in rat_decoders:
-        log.debug("Running Malwareconfigs on %s", file_path)
+        log.debug("Running Malwareconfig parser for %s on %s", cape_name, file_path)
         try:
             module = False
             file_info = fileparser.FileParser(rawdata=file_data)
@@ -335,7 +335,8 @@ def static_config_lookup(file_path: str, sha256: str = False) -> dict:
         dict or None: A dictionary containing the configuration information if found, otherwise None.
     """
     if not sha256:
-        sha256 = hashlib.sha256(open(file_path, "rb").read()).hexdigest()
+        with open(file_path, "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
 
     if repconf.mongodb.enabled:
         document_dict = mongo_find_one(

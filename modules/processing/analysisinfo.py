@@ -60,15 +60,23 @@ class AnalysisInfo(Processing):
             package = package["name"]
         if not package and path_exists(self.log_path):
             try:
-                analysis_log = codecs.open(self.log_path, "rb", "utf-8").read()
+                with codecs.open(self.log_path, "rb", "utf-8") as f:
+                    analysis_log = f.read()
             except ValueError as e:
                 raise CuckooProcessingError(f"Error decoding {self.log_path}: {e}") from e
             except (IOError, OSError) as e:
                 raise CuckooProcessingError(f"Error opening {self.log_path}: {e}") from e
             else:
                 with suppress(Exception):
-                    idx = analysis_log.index('INFO: Automatically selected analysis package "')
-                    package = analysis_log[idx + 47 :].split('"', 1)[0]
+                    # Try both Windows and Linux analyzer log formats
+                    for marker in (
+                        'INFO: analysis package selected: "',
+                        'INFO: Automatically selected analysis package "',
+                    ):
+                        idx = analysis_log.find(marker)
+                        if idx != -1:
+                            package = analysis_log[idx + len(marker) :].split('"', 1)[0]
+                            break
         return package
 
     def run(self):

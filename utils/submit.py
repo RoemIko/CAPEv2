@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import sys
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import requests
@@ -29,7 +30,92 @@ from lib.cuckoo.core.startup import check_user_permissions
 check_user_permissions(os.getenv("CAPE_AS_ROOT", False))
 
 
-def main():
+def submit_file(
+    db: Database,
+    file_path: str,
+    package: str = "",
+    timeout: int = 0,
+    options: str = "",
+    priority: int = 1,
+    machine: str = "",
+    platform: str = "",
+    memory: bool = False,
+    enforce_timeout: bool = False,
+    custom: str = "",
+    tags: Optional[str] = None,
+    route: Optional[str] = None,
+    clock: Optional[str] = None,
+    unique: bool = False,
+    quiet: bool = False,
+    category: Optional[str] = None,
+    filename: Optional[str] = None,
+) -> Tuple[List[int], Dict[str, Any]]:
+    if not File(file_path).get_size():
+        if not quiet:
+            print((bold(yellow("Empty") + ": sample {0} (skipping file)".format(file_path))))
+        return [], {"errors": ["Empty file"]}
+
+    if unique:
+        with db.session.begin():
+            already_exists = db.check_file_uniq(File(file_path).get_sha256())
+        if already_exists:
+            msg = ": Sample {0} (skipping file)".format(file_path)
+            if not quiet:
+                print((bold(yellow("Duplicate")) + msg))
+            return [], {"errors": ["Duplicate"]}
+
+    # Ensure logging is available
+    import logging
+    l = logging.getLogger(__name__)
+
+    tmp_path = ""
+    task_ids = []
+    extra_details = {}
+    try:
+        # Create a temp file with the correct name for demuxing (if needed)
+        # Some demuxers rely on the filename/extension
+        with open(file_path, "rb") as f:
+            if not filename:
+                filename = os.path.basename(file_path)
+            tmp_path = store_temp_file(f.read(), sanitize_filename(filename))
+
+        with db.session.begin():
+            # ToDo expose extra_details["errors"]
+            task_ids, extra_details = db.demux_sample_and_add_to_db(
+                file_path=tmp_path,
+                package=package,
+                timeout=timeout,
+                options=options,
+                priority=priority,
+                machine=machine,
+                platform=platform,
+                memory=memory,
+                custom=custom,
+                enforce_timeout=enforce_timeout,
+                clock=clock,
+                tags=tags,
+                route=route,
+                category=category,
+            )
+        return task_ids, extra_details
+    except CuckooDemuxError as e:
+        l.error("Demux error: %s", e)
+        return [], {"errors": [str(e)]}
+    except Exception as e:
+        import traceback
+        l.error("Unexpected error in submit_file: %s\n%s", e, traceback.format_exc())
+        return [], {"errors": [str(e)]}
+    finally:
+        # If submission failed, clean up the temp file.
+        # If it succeeded, CAPE's AnalysisManager will handle it.
+        if not task_ids and tmp_path and path_exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception as e:
+                l.warning("Failed to delete temp file %s: %s", tmp_path, e)
+
+
+def main() -> Optional[bool]:
     parser = argparse.ArgumentParser()
     parser.add_argument("target", help="URL, path to the file or folder to analyze")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging")
@@ -107,10 +193,9 @@ def main():
     parser.add_argument(
         "--shuffle", action="store_true", default=False, help="Shuffle samples before submitting them", required=False
     )
-    parser.add_argument(
-        "--unique", action="store_true", default=False, help="Only submit new samples, ignore duplicates", required=False
-    )
+    parser.add_argument("--unique", action="store_true", default=False, help="Only submit new samples, ignore duplicates", required=False)
     parser.add_argument("--quiet", action="store_true", default=False, help="Only print text on failure", required=False)
+    parser.add_argument("--name", type=str, action="store", default=None, help="Desired sample name", required=False)
     parser.add_argument("--procdump", action="store_true", default=False, help="Disable process dumps", required=False)
 
     try:
@@ -278,9 +363,66 @@ def main():
                 else:
                     url = "http://{0}/apiv2/tasks/create/file/".format(args.remote)
 
-                files = dict(file=open(file_path, "rb"), filename=os.path.basename(file_path))
+                with open(file_path, "rb") as f:
+                    filename = args.name or os.path.basename(file_path)
+                    files = dict(file=f, filename=filename)
 
-                data = dict(
+                    data = dict(
+                        package=args.package,
+                        timeout=sane_timeout,
+                        options=args.options,
+                        priority=args.priority,
+                        machine=args.machine,
+                        platform=args.platform,
+                        memory=args.memory,
+                        enforce_timeout=args.enforce_timeout,
+                        custom=args.custom,
+                        tags=args.tags,
+                        route=args.route,
+                    )
+
+                    try:
+                        if args.user and args.password:
+                            if args.ssl:
+                                if args.sslnoverify:
+                                    verify = False
+                                else:
+                                    verify = True
+                                response = requests.post(url, auth=(args.user, args.password), files=files, data=data, verify=verify)
+                            else:
+                                response = requests.post(url, auth=(args.user, args.password), files=files, data=data)
+                        elif args.token:
+                            if args.ssl:
+                                if args.sslnoverify:
+                                    verify = False
+                                else:
+                                    verify = True
+                                response = requests.post(
+                                    url, headers={"Authorization": f"Token {args.token}"}, files=files, data=data, verify=verify
+                                )
+                            else:
+                                response = requests.post(url, headers={"Authorization": f"Token {args.token}"}, files=files, data=data)
+                        else:
+                            if args.ssl:
+                                if args.sslnoverify:
+                                    verify = False
+                                else:
+                                    verify = True
+                                response = requests.post(url, files=files, data=data, verify=verify)
+                            else:
+                                response = requests.post(url, files=files, data=data)
+
+                    except Exception as e:
+                        print((bold(red("Error")) + ": unable to send file: {0}".format(e)))
+                        return False
+
+                json = response.json()
+                task_ids = json["data"].get("task_ids")
+
+            else:
+                task_ids, extra_details = submit_file(
+                    db=db,
+                    file_path=file_path,
                     package=args.package,
                     timeout=sane_timeout,
                     options=args.options,
@@ -288,82 +430,16 @@ def main():
                     machine=args.machine,
                     platform=args.platform,
                     memory=args.memory,
-                    enforce_timeout=args.enforce_timeout,
                     custom=args.custom,
+                    enforce_timeout=args.enforce_timeout,
+                    clock=args.clock,
                     tags=args.tags,
                     route=args.route,
+                    unique=args.unique,
+                    quiet=args.quiet,
+                    filename=args.name,
                 )
 
-                try:
-                    if args.user and args.password:
-                        if args.ssl:
-                            if args.sslnoverify:
-                                verify = False
-                            else:
-                                verify = True
-                            response = requests.post(url, auth=(args.user, args.password), files=files, data=data, verify=verify)
-                        else:
-                            response = requests.post(url, auth=(args.user, args.password), files=files, data=data)
-                    elif args.token:
-                        if args.ssl:
-                            if args.sslnoverify:
-                                verify = False
-                            else:
-                                verify = True
-                            response = requests.post(
-                                url, headers={"Authorization": f"Token {args.token}"}, files=files, data=data, verify=verify
-                            )
-                        else:
-                            response = requests.post(url, headers={"Authorization": f"Token {args.token}"}, files=files, data=data)
-                    else:
-                        if args.ssl:
-                            if args.sslnoverify:
-                                verify = False
-                            else:
-                                verify = True
-                            response = requests.post(url, files=files, data=data, verify=verify)
-                        else:
-                            response = requests.post(url, files=files, data=data)
-
-                except Exception as e:
-                    print((bold(red("Error")) + ": unable to send file: {0}".format(e)))
-                    return False
-
-                json = response.json()
-                task_ids = json["data"].get("task_ids")
-
-            else:
-                if args.unique:
-                    with db.session.begin():
-                        already_exists = db.check_file_uniq(File(file_path).get_sha256())
-                    if already_exists:
-                        msg = ": Sample {0} (skipping file)".format(file_path)
-                        if not args.quiet:
-                            print((bold(yellow("Duplicate")) + msg))
-                        continue
-
-                try:
-                    tmp_path = store_temp_file(open(file_path, "rb").read(), sanitize_filename(os.path.basename(file_path)))
-                    with db.session.begin():
-                        # ToDo expose extra_details["errors"]
-                        task_ids, extra_details = db.demux_sample_and_add_to_db(
-                            file_path=tmp_path,
-                            package=args.package,
-                            timeout=sane_timeout,
-                            options=args.options,
-                            priority=args.priority,
-                            machine=args.machine,
-                            platform=args.platform,
-                            memory=args.memory,
-                            custom=args.custom,
-                            enforce_timeout=args.enforce_timeout,
-                            clock=args.clock,
-                            tags=args.tags,
-                            route=args.route,
-                        )
-                except CuckooDemuxError as e:
-                    task_ids = []
-                    print((bold(red("Error")) + ": {0}".format(e)))
             tasks_count = len(task_ids)
             if tasks_count > 1:
                 if not args.quiet:

@@ -18,22 +18,19 @@ from sqlalchemy.exc import SQLAlchemyError
 from lib.cuckoo.common.exceptions import CuckooUnserviceableTaskError
 from lib.cuckoo.common.path_utils import path_mkdir
 from lib.cuckoo.common.utils import store_temp_file
-from lib.cuckoo.core import database
-from lib.cuckoo.core.database import (
+from lib.cuckoo.core.data import tasking
+from lib.cuckoo.core.data.task import (
     TASK_BANNED,
     TASK_COMPLETED,
     TASK_PENDING,
     TASK_REPORTED,
     TASK_RUNNING,
-    Error,
-    Guest,
-    Machine,
-    Sample,
-    Tag,
-    Task,
-    _Database,
-    machines_tags,
-)
+    Task)
+from lib.cuckoo.core.data.guests import Guest
+from lib.cuckoo.core.data.samples import Sample
+from lib.cuckoo.core.data.machines import Machine, machines_tags
+from lib.cuckoo.core.data.db_common import _utcnow_naive, Tag, Error
+from lib.cuckoo.core.database import _Database
 
 
 @dataclasses.dataclass
@@ -435,7 +432,7 @@ class TestDatabaseEngine:
             assert db.update_clock(1) is None
 
             task_id = db.add_path(temp_filename)
-            now = datetime.datetime.utcnow()
+            now = _utcnow_naive()
             monkeypatch.setattr(db.cfg.cuckoo, "daydelta", 1)
             new_clock = now + datetime.timedelta(days=1)
             assert db.update_clock(task_id) == new_clock
@@ -445,8 +442,8 @@ class TestDatabaseEngine:
     def test_update_clock_url(self, db: _Database, monkeypatch, freezer):
         with db.session.begin():
             task_id = db.add_url("https://www.google.com")
-            now = datetime.datetime.utcnow()
-            monkeypatch.setattr(database.datetime, "utcnow", lambda: now)
+            now = _utcnow_naive()
+            monkeypatch.setattr(tasking.datetime, "utcnow", lambda: now)
             # URL's are unaffected by the daydelta setting.
             monkeypatch.setattr(db.cfg.cuckoo, "daydelta", 1)
             assert db.update_clock(task_id) == now
@@ -461,7 +458,7 @@ class TestDatabaseEngine:
             task = db.session.get(Task, task_id)
             assert task.started_on is None
             assert task.completed_on is None
-            now = datetime.datetime.utcnow()
+            now = _utcnow_naive()
             freezer.move_to(now)
             db.set_status(task_id, TASK_RUNNING)
             task = db.session.get(Task, task_id)
@@ -556,16 +553,16 @@ class TestDatabaseEngine:
         with db.session.begin():
             m1 = db.session.get(Machine, m1.id)
             assert m1.locked
-            assert m1.locked_changed_on == datetime.datetime.now()
+            assert m1.locked_changed_on == _utcnow_naive()
             assert m1.status == "running"
-        freezer.move_to(datetime.datetime.now() + datetime.timedelta(minutes=5))
+        freezer.move_to(_utcnow_naive() + datetime.timedelta(minutes=5))
         with db.session.begin():
             assert db.count_machines_running() == 1
             db.unlock_machine(m1)
         with db.session.begin():
             m1 = db.session.get(Machine, m1.id)
             assert not m1.locked
-            assert m1.locked_changed_on == datetime.datetime.now()
+            assert m1.locked_changed_on == _utcnow_naive()
         with db.session.begin():
             assert db.count_machines_running() == 0
 
@@ -652,7 +649,7 @@ class TestDatabaseEngine:
             db.guest_stop(guest_id)
         with db.session.begin():
             guest = db.session.scalar(select(Guest))
-            assert guest is not None and guest.shutdown_on == datetime.datetime.now()
+            assert guest is not None and guest.shutdown_on == _utcnow_naive()
             db.guest_stop(guest_id + 1)
             db.guest_remove(guest_id)
         with db.session.begin():
@@ -707,7 +704,7 @@ class TestDatabaseEngine:
         with db.session.begin():
             machine = db.session.scalar(select(Machine).where(Machine.label == "l2"))
             assert machine.status == "running"
-            assert machine.status_changed_on == datetime.datetime.now()
+            assert machine.status_changed_on == _utcnow_naive()
 
             machine = db.session.scalar(select(Machine).where(Machine.label == "l1"))
             assert machine.status != "running"
@@ -742,7 +739,7 @@ class TestDatabaseEngine:
             with open(temp_filename, "rb") as fil:
                 sha256 = hashlib.sha256(fil.read()).hexdigest()
             assert db.check_file_uniq(sha256)
-            freezer.move_to(datetime.datetime.now() + datetime.timedelta(hours=2))
+            freezer.move_to(_utcnow_naive() + datetime.timedelta(hours=2))
             assert not db.check_file_uniq(sha256, hours=1)
 
     # ToDo upgrade to add really parent check
@@ -804,7 +801,7 @@ class TestDatabaseEngine:
             t1 = db.add_path(temp_filename, options="minhook=1")
             t2 = db.add_url("https://2.com", tags_tasks="tag1")
             t3 = db.add_url("https://3.com", user_id=5)
-        start = datetime.datetime.now()
+        start = _utcnow_naive()
         with db.session.begin():
 
             def get_ids(**kwargs):
@@ -846,7 +843,7 @@ class TestDatabaseEngine:
         with db.session.begin():
             assert db.minmax_tasks() == (0, 0)
 
-        start_time = datetime.datetime.now()
+        start_time = _utcnow_naive()
         with db.session.begin():
             t1 = db.add_url("https://1.com")
             t2 = db.add_url("https://2.com")

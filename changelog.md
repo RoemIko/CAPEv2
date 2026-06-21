@@ -1,3 +1,134 @@
+### [08.06.2026]
+* Threat Discovery & Hunting Workstation Dashboard:
+    * Integrated centralized dynamic multi-faceted database clustering across 12 categories (Domains, IPs, Mutexes, Dropped Files, Commands, Registry Keys, Hashes, ImpHashes, and Signatures).
+    * Created dynamic, cascading, auto-reloaded JSON configuration cacher (`conf/hunt.json`) with hierarchical lookup order (`custom/conf` ➔ `conf` ➔ `conf/default`).
+    * Built high-performance, memory-speed caching system utilizing OS modification-time (`mtime`) checks for instant reloading without disk parsing or server restarts.
+    * Integrated inline threat intelligence OSINT pivoting links (VirusTotal, Shodan, Censys, MalwareBazaar, and AlienVault OTX) and transaction-safe, sanitized AJAX-based task tagging group actions.
+    * Added comprehensive unit testing covering all view states, error handling, and security measures.
+
+### [05.06.2026]
+* Monitor updates:
+    * NtCreateUserProcess hook: Dynamically patch ping commandline to thwart ping delays (e.g. Formbook/Xloader)
+    * Debugger: Persistent software breakpoints via softbpmode=1 (default is one-shot)
+    * TLS capture improvements
+
+### [01.06.2026]
+* Monitor update: Fix standalone mode broken since August
+
+### [29.05.2026]
+* Monitor updates:
+    * Debugger: Action target argument enhanced with keywords "src", "dst", "&src" & "&dst" (e.g. action0=dumpimage:&src) for instruction parsing
+    * Debugger: Add ignored non-internal breakpoints to analysis log
+
+### [28.05.2026]
+* Monitor update: Fix issue with hooking very small 32-bit functions (e.g. GetCommandLineA/W)
+
+### [13.05.2026]
+* Update Formbook (Xloader) dynamic config extractor
+* Monitor updates:
+    * Enhance 'string' debugger action to work without target by iterating through registers
+    * Add pid to log output in DumpSectionViewsForPid()
+    * Fix bug with GetAccessibleSize() causing rare access violations
+
+### [08.05.2026]
+* Monitor update: fix COM hooks
+
+### [05.05.2026]
+* Monitor updates:
+    * Instrumentation callback: refine dll filtering and add kernelbase.dll (syscall hooks)
+    * Unpacker: refine entropy-based detection of shellcode within mapped images, don't drop tracked regions in FreeHandler()
+
+### [26.03.2026]
+* Monitor update: RtlDispatchException hook: check module_name pointer before dereference
+* KVMRemote machinery updated and  moved to main repo
+* New Hyper-V machinery module
+
+### [17.03.2026]
+* Monitor updates:
+    * Fix issue with multiple DumpCount increments causing excessive dump limiting
+    * AddTrackedRegion: Remove logging failure of GetEntropy()
+    * Fix GetTrackedRegion() issue with empty list entry
+    * 64-bit browser compatibility: enhance CheckDontMonitorList() for 64-bit paths
+    * Add option: include-apis - colon-separated list of apinames
+    * ClearThreadBreakpoint: only call ClearThreadBreakpoint() if address set, improve debug output in ClearDebugRegister()
+    * SetFileInformationByHandle: standardise FILE_DEL message
+    * Debugger: Fix iterator invalidation bug in ClearSoftwareBreakpoints(), ClearSoftwareBreakpointsInRange()
+
+### [06.03.2026]
+* Monitor update: Thread resume: fix issue with thread id passed in RESUME: message causing detonation issues
+
+### [02.03.2026]
+* PPLinject V2: Compatibility with all Win10 (22H2+) & Win11 (<=23H2)
+* Monitor updates:
+    * Disable manifest generation: prevent mui load attempts on 22H2+
+    * WMI fixes (thanks doomedraven)
+
+### [18.02.2026]
+* UPX Unpacker: enable import reconstruction
+* Monitor updates:
+    * Fix issue with VerifyHeaders() checking EP RVA in file: FileOffsetFromRVA()
+    * Add pids to FILE_NEW, FILE_DEL & FILE_MOVE monitor messages to accompany analyzer fix
+    * New hooks: RtlRemoveVectoredExceptionHandler, UnhandledExceptionFilter, GetPhysicallyInstalledSystemMemory, K32EnumProcesses, WTSEnumerateProcessesW, WTSEnumerateProcessesExW, LdrGetDllHandleEx, WTGetSignatureInfo, RtlWow64SetThreadContext
+    * YaraHarness: add 'coverage' action to remove dll from system 'range'
+    * Trace: improve recognition and handling of distinct code regions during debugging/tracing, expand ProcessOEP() action to allow shellcode dumping, refine StrTest(W) functions to filter more control characters from debugger log
+    * Add ntdll unhook protection (ntdll-unhook=1) via prevent_module_unhooking() from NtReadFile hook
+    * Add general hook protection (hook-protect=1) to protect hooks other than ntdll (ntdll-protect) - off by default
+    * Hooking: replace (allocating) convert_address_to_dll_name_and_offset() with non-allocating get_module_name()
+
+### [11.02.2026]
+* Guacamole integration:
+    * New dependency `channels[daphne]>=4.0.0` added.
+
+### [04.02.2026]
+* Network Analysis:
+    * Integrated process mapping directly into `network` processing module.
+    * Added ability to show network details (DNS, HTTP, TCP/UDP) captured from behavioral analysis in the network results.
+    * This allows recovery of network activity that might be missing from PCAP (e.g., due to capture evasion or failed interception).
+    * Centralized network utility functions into `lib/cuckoo/common/network_utils.py` for better maintainability and performance.
+    * New configuration option `process_map` under `[network]` section in `processing.conf`.
+* Web UI:
+    * Added Process Name and PID columns across all network analysis views (TCP, UDP, ICMP, DNS, HTTP, IRC, SMTP).
+
+### [28.01.2026]
+* CAPE Agent:
+    * Ported to Golang for improved stealth, performance, and zero-dependency deployment.
+    * Implemented strict host-only security (localhost blocking) and optional Token Authentication.
+    * Added secure `/push` endpoint for host-driven file retrieval.
+    * Added `/update` endpoint for seamless remote agent updates.
+* Distributed Cluster:
+    * New Go Fast-Fetcher: High-concurrency retrieval module supporting direct NFS copy.
+    * Added JSON configuration support for the fetcher to secure database credentials.
+    * Added `ignore_patterns` support for optimized cluster reporting.
+* Web UI / UX Improvements:
+    * Fixed badge readability: Enforced high-contrast text (e.g., black on yellow/info) and fixed unreadable hover states.
+    * Categorized search help table into logical groups (General, File, Network, Behavior).
+    * Fixed search box highlight color to match the theme.
+* Search Optimization:
+    * General search terms are now handled as strings (exact match) by default instead of regex to significantly improve database performance.
+    * Regex search is automatically triggered when using special characters (e.g., `^ $ | ? * + ( ) [ ] { }`).
+    * Updated search UI help and placeholders.
+
+### [16.01.2026] CAPE v2.5
+* Bootstrap 5 upgrade and some visual WEBGUI rewamp. Some improvements still might come soon!
+* htmlreport - rewamp!
+* cape2.sh - Libvirt + YARA python libraries install without external scripts.
+* Datatime UTC normalization on tasks/VMs changes.
+* Added check on startup for enable firewall.
+* Volatility3 - more modules added. Test them and let us know if you have any issue.
+* Filedescripts leaks fixed.
+* Stucked VM monitoring and kill. [PR](https://github.com/kevoreilly/CAPEv2/pull/2809)
+
+PS no changes required to CAPA library to support CAPE v2.5 ;)
+
+### [02.01.2026]
+* CAPE installer:
+    *  now support custom destination folder env variable:
+        * `CAPE_ROOT=<path>/CAPEv2`
+    * UV support with env variable:
+        * `USE_UV=True`
+    * Example:
+        * `USE_UV=True CAPE_ROOT=/mnt/external/CAPEv2 bash cape2.sh all | tee cape2.log`
+
 ### [24.11.2025]
 * Monitor update: Fix issue with RESUME: monitor message from NtResumeProcess hook
 

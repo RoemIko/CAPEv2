@@ -15,9 +15,12 @@ import sys
 from contextlib import suppress
 from pathlib import Path
 
-# Private
-import custom.signatures
-
+try:
+    # Private
+    import custom.signatures
+    HAS_CUSTOM_SIGNATURES = True
+except ModuleNotFoundError:
+    HAS_CUSTOM_SIGNATURES = False
 try:
     import custom.signatures.all
 except ImportError:
@@ -49,7 +52,8 @@ from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooOperationalError, CuckooStartupError
 from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.common.utils import create_folders
-from lib.cuckoo.core.database import TASK_FAILED_ANALYSIS, TASK_RUNNING, Database
+from lib.cuckoo.core.database import Database
+from lib.cuckoo.core.data.task import TASK_FAILED_ANALYSIS, TASK_RUNNING
 from lib.cuckoo.core.log import init_logger
 from lib.cuckoo.core.plugins import import_package, import_plugin, list_plugins
 from lib.cuckoo.core.rooter import rooter, socks5s, vpns
@@ -117,17 +121,45 @@ def check_webgui_mongo():
         # Create an index based on the info.id dict key. Increases overall scalability
         # with large amounts of data.
         # Note: Silently ignores the creation if the index already exists.
-        mongo_create_index("analysis", "info.id", name="info.id_1")
-        # Some indexes that can be useful for some users
-        mongo_create_index("files", "md5", name="file_md5")
-        mongo_create_index("files", [("_task_ids", 1)])
+        index_configs = [
+            ("analysis", [("info.id", -1)], {"name": "info_id_desc"}),
+            ("files", [("_task_ids", 1)], {}),
+        ]
+        if repconf.mongodb.get("index_yara", False):
+            index_configs.extend([
+                ("files", "yara.name", {"name": "yara_name"}),
+                ("files", "cape_yara.name", {"name": "cape_yara_name"}),
+            ])
+        if repconf.mongodb.get("index_clamav", False):
+            index_configs.append(("files", "clamav", {"name": "clamav_index"}))
+        if repconf.mongodb.get("index_hashes", False):
+            index_configs.extend([
+                ("files", "md5", {"name": "file_md5"}),
+                ("files", "sha1", {"name": "file_sha1"}),
+                ("files", "ssdeep", {"name": "file_ssdeep"}),
+            ])
+        if repconf.mongodb.get("index_detections", False):
+            index_configs.append(("analysis", [("detections.family", 1), ("_id", -1)], {"name": "detections_family_id_desc"}))
+        if repconf.mongodb.get("index_filenames", False):
+            index_configs.append(("analysis", [("target.file.name", 1), ("_id", -1)], {"name": "target_file_name_id_desc"}))
 
-        # side indexes as ideas
-        """
-            mongo_create_index("analysis", "detections", name="detections_1")
-            mongo_create_index("analysis", "target.file.name", name="name_1")
-        """
+        # Obsolete indexes to drop
+        obsolete_indexes = {
+            "analysis": ["info.id_1", "detections_family", "name_1", "detections_family_1", "target_file_name_1"],
+        }
 
+        for coll, keys, kwargs in index_configs:
+            try:
+                mongo_create_index(coll, keys, **kwargs)
+            except Exception as e:
+                log.warning("Failed to create MongoDB index %s on %s: %s", kwargs.get("name", keys), coll, e)
+
+        # Drop obsolete indexes
+        from dev_utils.mongodb import results_db
+        for coll, indexes in obsolete_indexes.items():
+            for index_name in indexes:
+                with suppress(Exception):
+                    getattr(results_db, coll).drop_index(index_name)
     elif repconf.elasticsearchdb.enabled:
         # ToDo add check
         pass
@@ -200,7 +232,10 @@ def check_linux_dist():
     with suppress(AttributeError):
         platform_details = platform.dist()
         if platform_details[0] != "Ubuntu" and platform_details[1] not in ubuntu_versions:
-            log.info("[!] You are using NOT supported Linux distribution by devs! Any issue report is invalid! We only support Ubuntu LTS %s", ubuntu_versions)
+            log.info(
+                "[!] You are using NOT supported Linux distribution by devs! Any issue report is invalid! We only support Ubuntu LTS %s",
+                ubuntu_versions,
+            )
 
 
 def init_logging(level: int):
@@ -289,7 +324,8 @@ def init_modules():
     import_package(modules.signatures.windows)
     import_package(modules.signatures.linux)
     # Import all private signatures
-    import_package(custom.signatures)
+    if HAS_CUSTOM_SIGNATURES:
+        import_package(custom.signatures)
     if HAS_CUSTOM_SIGNATURES_ALL:
         import_package(custom.signatures.all)
     if HAS_CUSTOM_SIGNATURES_LINUX:
@@ -327,8 +363,8 @@ def check_snapshot_state():
         from xml.etree import ElementTree
     except ImportError:
         raise CuckooStartupError(
-            "The 'libvirt-python' library is required for KVM/QEMU machinery but is not installed. "
-            "Please install it (e.g., 'cd /opt/CAPEv2/ ; sudo -u cape /etc/poetry/bin/poetry run extra/libvirt_installer.sh')."
+            "The 'libvirt-python' library is required for KVM/QEMU machinery but could not be imported. "
+            "Please ensure that CAPE is being launched by the same Python environment configured by the install script."
         )
 
     machinery_config = Config(cuckoo.cuckoo.machinery)
@@ -354,6 +390,8 @@ def check_snapshot_state():
                 machine_config = machinery_config.get(machine_name)
                 machine_name = machine_config.get("label")
                 domain = conn.lookupByName(machine_name)
+
+
                 # Check for valid architecture configuration.
                 arch = machine_config.get("arch")
                 if not arch:
@@ -464,6 +502,31 @@ def init_rooter():
     rooter("state_enable")
 
     # ToDo check if ip_forward is on
+
+    # Check if UFW is enabled. If it is, it could interfere with routing.
+    # We use subprocess.run for better error handling and stdout capture.
+    try:
+        ufw_proc = subprocess.run(["ufw", "status"], capture_output=True, text=True, check=False)
+
+        if ufw_proc.returncode == 0:
+            if "Status: active" in ufw_proc.stdout:
+                log.warning(
+                    "UFW (Uncomplicated Firewall) is active. This might interfere with CAPEv2's network routing/analysis. "
+                    "Please ensure UFW is configured to allow all necessary traffic for CAPEv2 or consider disabling it for analysis. "
+                    "You can check UFW rules with 'sudo ufw status verbose'."
+                )
+            else:
+                log.debug("UFW is not active, which is ideal for CAPEv2's routing setup.")
+        else:
+            log.debug(
+                "Could not check UFW status (command exited with code %d). "
+                "Output: %s. Error: %s", ufw_proc.returncode, ufw_proc.stdout, ufw_proc.stderr
+            )
+    except FileNotFoundError:
+        log.debug("UFW command not found. Assuming UFW is not in use.")
+    except Exception as e:
+        log.debug("An unexpected error occurred while checking UFW status: %s", e)
+
 
 
 def init_routing():

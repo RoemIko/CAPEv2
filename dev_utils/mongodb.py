@@ -1,11 +1,8 @@
 import collections
 import functools
-import itertools
 import logging
 import time
-from typing import Any, Callable, Sequence
-
-from bson import ObjectId
+from typing import Callable, Sequence
 
 from lib.cuckoo.common.config import Config
 
@@ -25,17 +22,25 @@ if repconf.mongodb.enabled:
 
     def connect_to_mongo() -> MongoClient:
         try:
-            return MongoClient(
-                host=repconf.mongodb.get("host", "127.0.0.1"),
-                port=repconf.mongodb.get("port", 27017),
+            host = repconf.mongodb.get("host", "127.0.0.1")
+            port = repconf.mongodb.get("port", 27017)
+            client = MongoClient(
+                host=host,
+                port=port,
                 username=repconf.mongodb.get("username"),
                 password=repconf.mongodb.get("password"),
                 authSource=repconf.mongodb.get("authsource", "cuckoo"),
                 tlsCAFile=repconf.mongodb.get("tlscafile", None),
-                connect=False,
+                connect=True, # Force connection now to catch issues
+                serverSelectionTimeoutMS=5000,
+                socketTimeoutMS=30000,
             )
-        except (ConnectionFailure, ServerSelectionTimeoutError):
-            log.error("Cannot connect to MongoDB")
+            # Ping the server to ensure it's alive
+            client.admin.command('ping')
+            log.info("Successfully connected to MongoDB at %s:%s", host, port)
+            return client
+        except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+            log.error("Cannot connect to MongoDB: %s", e)
         except Exception as e:
             log.warning("Unable to connect to MongoDB database: %s, %s", mdb, e)
 
@@ -43,8 +48,27 @@ if repconf.mongodb.enabled:
     # q = results_db.analysis.find({"info.id": 26}, {"memory": 1})
     # https://pymongo.readthedocs.io/en/stable/changelog.html
 
-    conn = connect_to_mongo()
-    results_db = conn[mdb]
+    _client = None
+    _results_db = None
+
+    def get_mongodb():
+        global _client, _results_db
+        if _client is None:
+            _client = connect_to_mongo()
+            _results_db = _client[mdb]
+        return _results_db
+
+    # For legacy code that expects results_db to be an object
+    class LegacyDB:
+        @property
+        def analysis(self): return get_mongodb().analysis
+        @property
+        def calls(self): return get_mongodb().calls
+        @property
+        def files(self): return get_mongodb().files
+        def __getattr__(self, name): return getattr(get_mongodb(), name)
+
+    results_db = LegacyDB()
 
 MAX_AUTO_RECONNECT_ATTEMPTS = 5
 
@@ -114,7 +138,7 @@ def mongo_insert_one(collection: str, doc):
 
 
 @graceful_auto_reconnect
-def mongo_find(collection: str, query, projection=False, sort=None, limit=None):
+def mongo_find(collection: str, query, projection=False, sort=None, limit=None, no_hooks=False):
     if sort is None:
         sort = [("_id", -1)]
 
@@ -125,23 +149,30 @@ def mongo_find(collection: str, query, projection=False, sort=None, limit=None):
         find_by = functools.partial(find_by, limit=limit)
 
     result = find_by()
-    if result:
+    if result and not no_hooks:
         for hook in hooks[mongo_find][collection]:
             result = hook(result)
     return result
 
 
 @graceful_auto_reconnect
-def mongo_find_one(collection: str, query, projection=False, sort=None):
+def mongo_find_one(collection: str, query, projection=False, sort=None, max_time_ms=None, no_hooks=False):
     if sort is None:
         sort = [("_id", -1)]
+
+    kwargs = {"sort": sort}
+    if max_time_ms:
+        kwargs["max_time_ms"] = max_time_ms
+
     if projection:
-        result = getattr(results_db, collection).find_one(query, projection, sort=sort)
+        result = getattr(results_db, collection).find_one(query, projection, **kwargs)
     else:
-        result = getattr(results_db, collection).find_one(query, sort=sort)
-    if result:
+        result = getattr(results_db, collection).find_one(query, **kwargs)
+
+    if result and not no_hooks:
         for hook in hooks[mongo_find_one][collection]:
             result = hook(result)
+
     return result
 
 
@@ -161,11 +192,11 @@ def mongo_update_many(collection: str, query, update):
 
 
 @graceful_auto_reconnect
-def mongo_update_one(collection: str, query, projection, bypass_document_validation: bool = False):
-    if query.get("$set", None):
-        for hook in hooks[mongo_find_one][collection]:
-            query["$set"] = hook(query["$set"])
-    return getattr(results_db, collection).update_one(query, projection, bypass_document_validation=bypass_document_validation)
+def mongo_update_one(collection: str, query, update, bypass_document_validation: bool = False):
+    if isinstance(update, dict) and update.get("$set"):
+        for hook in hooks[mongo_update_one][collection]:
+            update["$set"] = hook(update["$set"])
+    return getattr(results_db, collection).update_one(query, update, bypass_document_validation=bypass_document_validation)
 
 
 @graceful_auto_reconnect
@@ -187,7 +218,7 @@ def mongo_find_one_and_update(collection, query, update, projection=None):
 
 @graceful_auto_reconnect
 def mongo_drop_database(database: str):
-    conn.drop_database(database)
+    get_mongodb().client.drop_database(database)
 
 
 def mongo_delete_data(task_ids: int | Sequence[int]) -> None:
@@ -224,43 +255,14 @@ def mongo_delete_data_range(*, range_start: int = 0, range_end: int = 0) -> None
 
 
 def mongo_delete_calls(task_ids: Sequence[int] | None) -> None:
-    """Delete calls by primary key.
-
-    This obtains the call IDs from the analysis collection, which are then used
-    to delete calls in batches."""
-    log.info("attempting to delete calls for %d tasks", len(task_ids))
-
-    query = {"info.id": {"$in": task_ids}}
-    projection = {"behavior.processes.calls": 1}
-    tasks: list[dict[str, Any]] = mongo_find("analysis", query, projection)
-
-    if not tasks:
-        return
-
-    delete_target_ids: list[ObjectId] = []
-
-    def get_call_ids_from_task(task: dict[str, Any]) -> list[ObjectId]:
-        """Get the call IDs from an analysis document."""
-        processes = task.get("behavior", {}).get("processes", [])
-        calls = [proc.get("calls", []) for proc in processes]
-        return list(itertools.chain.from_iterable(calls))
-
-    for task in tasks:
-        delete_target_ids.extend(get_call_ids_from_task(task))
-
-    delete_target_ids = list(set(delete_target_ids))
-    chunk_size = 1000
-    for idx in range(0, len(delete_target_ids), chunk_size):
-        mongo_delete_many("calls", {"_id": {"$in": delete_target_ids[idx : idx + chunk_size]}})
-
-
-def mongo_delete_calls_by_task_id(task_ids: Sequence[int]) -> None:
     """Delete calls by querying the calls collection by the task_id field.
 
     Note, the task_id field was added to the calls collection in 9999881.
-    Objects added to the collection prior to this will not be deleted. Use
-    mongo_delete_calls for backwards compatibility.
+    Objects added to the collection prior to this will be deleted.
     """
+    if not task_ids:
+        return
+    log.info("attempting to delete calls for %d tasks", len(task_ids))
     mongo_delete_many("calls", {"task_id": {"$in": task_ids}})
 
 
@@ -283,7 +285,7 @@ def mongo_delete_calls_by_task_id_in_range(*, range_start: int = 0, range_end: i
 def mongo_is_cluster():
     # This is only useful at the moment for clean to prevent destruction of cluster database
     try:
-        conn.admin.command("listShards")
+        get_mongodb().client.admin.command("listShards")
         return True
     except OperationFailure:
         return False

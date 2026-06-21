@@ -32,7 +32,7 @@ ch.setFormatter(formatter)
 log.addHandler(ch)
 log.setLevel(logging.INFO)
 
-class s:
+class ServicePaths:
     iptables = None
     iptables_save = None
     iptables_restore = None
@@ -40,11 +40,14 @@ class s:
 
 
 def run(*args):
-    """Wrapper to Popen."""
+    """Wrapper to subprocess.run."""
     log.debug("Running command: %s", " ".join(args))
-    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-    stdout, stderr = p.communicate()
-    return stdout, stderr
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, check=False)
+        return p.stdout, p.stderr
+    except Exception as e:
+        log.error("Error executing command %s: %s", args, e)
+        return "", str(e)
 
 
 def get_tun_peer_address(interface_name):
@@ -100,10 +103,10 @@ def enable_ip_forwarding(sysctl="/usr/sbin/sysctl"):
 def check_tuntap(vm_name, main_iface):
     """Create tuntap device for qemu vms"""
     try:
-        run(s.ip, "tuntap", "add", "dev", f"tap_{vm_name}", "mode", "tap", "user", username)
-        run(s.ip, "link", "set", "tap_{vm_name}", "master", main_iface)
-        run(s.ip, "link", "set", "dev", "tap_{vm_name}", "up")
-        run(s.ip, "link", "set", "dev", main_iface, "up")
+        run(ServicePaths.ip, "tuntap", "add", "dev", f"tap_{vm_name}", "mode", "tap", "user", username)
+        run(ServicePaths.ip, "link", "set", "tap_{vm_name}", "master", main_iface)
+        run(ServicePaths.ip, "link", "set", "dev", "tap_{vm_name}", "up")
+        run(ServicePaths.ip, "link", "set", "dev", main_iface, "up")
         return True
     except subprocess.CalledProcessError:
         return False
@@ -112,10 +115,23 @@ def check_tuntap(vm_name, main_iface):
 def run_iptables(*args, **kwargs):
     if kwargs and kwargs.get('netns'):
         netns = kwargs.get('netns')
-        iptables_args = ["/usr/sbin/ip", "netns", "exec", netns, s.iptables]
+        iptables_args = ["/usr/sbin/ip", "netns", "exec", netns, ServicePaths.iptables]
     else:
-        iptables_args = [s.iptables]
+        iptables_args = [ServicePaths.iptables]
 
+    iptables_args.extend(list(args))
+    iptables_args.extend(["-m", "comment", "--comment", "CAPE-rooter"])
+    return run(*iptables_args)
+
+
+# SSLproxy TPROXY/NFQUEUE rules must use iptables-legacy because the nftables
+# compat layer does not correctly propagate NFQUEUE verdict marks within the
+# same mangle chain traversal. The legacy xtables backend handles this correctly.
+IPTABLES_LEGACY = "/usr/sbin/iptables-legacy"
+
+
+def run_iptables_legacy(*args):
+    iptables_args = [IPTABLES_LEGACY]
     iptables_args.extend(list(args))
     iptables_args.extend(["-m", "comment", "--comment", "CAPE-rooter"])
     return run(*iptables_args)
@@ -126,7 +142,7 @@ def cleanup_rooter():
     restore the resulting ruleset."""
     stdout = False
     try:
-        stdout, _ = run(s.iptables_save)
+        stdout, _ = run(ServicePaths.iptables_save)
     except OSError as e:
         log.error("Failed to clean CAPE rooter rules. Is iptables-save available? %s", e)
         return
@@ -136,7 +152,7 @@ def cleanup_rooter():
 
     cleaned = [line for line in stdout.split("\n") if line and "CAPE-rooter" not in line]
 
-    p = subprocess.Popen([s.iptables_restore], stdin=subprocess.PIPE, universal_newlines=True)
+    p = subprocess.Popen([ServicePaths.iptables_restore], stdin=subprocess.PIPE, universal_newlines=True)
     p.communicate(input="\n".join(cleaned))
 
     run_iptables("-F", "CAPE_ACCEPTED_SEGMENTS")
@@ -145,6 +161,23 @@ def cleanup_rooter():
     run_iptables("-N", "CAPE_REJECTED_SEGMENTS")
     run_iptables("-I", "FORWARD", "-j", "CAPE_REJECTED_SEGMENTS")
     run_iptables("-I", "FORWARD", "-j", "CAPE_ACCEPTED_SEGMENTS")
+
+    # Clean up any leftover SSLproxy iptables-legacy mangle rules tagged with CAPE-rooter.
+    # Only remove CAPE rules, not unrelated host firewall rules.
+    if os.path.isfile(IPTABLES_LEGACY):
+        for chain in ("FORWARD", "PREROUTING", "POSTROUTING"):
+            try:
+                output = subprocess.check_output(
+                    [IPTABLES_LEGACY, "-t", "mangle", "-S", chain],
+                    stderr=subprocess.DEVNULL,
+                    universal_newlines=True,
+                )
+                for line in reversed(output.strip().splitlines()):
+                    if "CAPE-rooter" in line and line.startswith("-A "):
+                        delete_args = line.replace("-A ", "-D ", 1).split()
+                        run(IPTABLES_LEGACY, "-t", "mangle", *delete_args)
+            except (subprocess.CalledProcessError, OSError):
+                pass
 
 
 def nic_available(interface):
@@ -173,31 +206,31 @@ def rt_available(rt_table):
 
 
 def init_vrf(rt_table, dirty_line_dev):
-    run(s.ip, "link", "add", "dirty-line", "type", "vrf", "table", rt_table)
-    run(s.ip, "link", "set", "dev", "dirty-line", "up")
-    run(s.ip, "rule", "add", "l3mdev", "proto", "kernel", "prio", "1000")
-    run(s.ip, "rule", "add", "l3mdev", "proto", "kernel", "unreachable", "prio", "1001")
-    run(s.ip, "rule", "add", "lookup", "local", "proto", "kernel", "prio", "32765")
-    run(s.ip, "rule", "delete", "lookup", "local", "prio", "0")
-    run(s.ip, "link", "set", "dev", dirty_line_dev, "master", "dirty-line")
+    run(ServicePaths.ip, "link", "add", "dirty-line", "type", "vrf", "table", rt_table)
+    run(ServicePaths.ip, "link", "set", "dev", "dirty-line", "up")
+    run(ServicePaths.ip, "rule", "add", "l3mdev", "proto", "kernel", "prio", "1000")
+    run(ServicePaths.ip, "rule", "add", "l3mdev", "proto", "kernel", "unreachable", "prio", "1001")
+    run(ServicePaths.ip, "rule", "add", "lookup", "local", "proto", "kernel", "prio", "32765")
+    run(ServicePaths.ip, "rule", "delete", "lookup", "local", "prio", "0")
+    run(ServicePaths.ip, "link", "set", "dev", dirty_line_dev, "master", "dirty-line")
 
 
 def cleanup_vrf(dirty_line_dev):
-    run(s.ip, "rule", "add", "lookup", "local", "proto", "kernel", "prio", "0")
-    run(s.ip, "rule", "delete", "lookup", "local", "prio", "32765")
-    run(s.ip, "rule", "delete", "l3mdev", "prio", "1000")
-    run(s.ip, "rule", "delete", "l3mdev", "unreachable", "prio", "1001")
-    run(s.ip, "link", "set", "dev", dirty_line_dev, "nomaster")
-    run(s.ip, "link", "set", "dev", "dirty-line", "down")
-    run(s.ip, "link", "del", "dirty-line")
+    run(ServicePaths.ip, "rule", "add", "lookup", "local", "proto", "kernel", "prio", "0")
+    run(ServicePaths.ip, "rule", "delete", "lookup", "local", "prio", "32765")
+    run(ServicePaths.ip, "rule", "delete", "l3mdev", "prio", "1000")
+    run(ServicePaths.ip, "rule", "delete", "l3mdev", "unreachable", "prio", "1001")
+    run(ServicePaths.ip, "link", "set", "dev", dirty_line_dev, "nomaster")
+    run(ServicePaths.ip, "link", "set", "dev", "dirty-line", "down")
+    run(ServicePaths.ip, "link", "del", "dirty-line")
 
 
 def add_dev_to_vrf(dev):
-    run(s.ip, "link", "set", "dev", dev, "master", "dirty-line")
+    run(ServicePaths.ip, "link", "set", "dev", dev, "master", "dirty-line")
 
 
 def delete_dev_from_vrf(dev):
-    run(s.ip, "link", "set", "dev", dev, "nomaster")
+    run(ServicePaths.ip, "link", "set", "dev", dev, "nomaster")
 
 
 def vpn_status(name):
@@ -465,6 +498,14 @@ def polarproxy_disable(interface, client, tls_port, proxy_port):
         "-j",
         "ACCEPT"
     )
+
+def libvirt_fwo_enable(interface, source):
+    """Enable LIBVIRT_FWO for a specific interface and source."""
+    run_iptables("-I", "LIBVIRT_FWO", "1", "-i", interface, "-s", source, "-j", "ACCEPT")
+
+def libvirt_fwo_disable(interface, source):
+    """Disable LIBVIRT_FWO for a specific interface and source."""
+    run_iptables("-D", "LIBVIRT_FWO", "-i", interface, "-s", source, "-j", "ACCEPT")
 
 def init_rttable(rt_table, interface):
     """Initialise routing table for this interface using routes
@@ -846,12 +887,12 @@ def interface_route_tun_enable(ipaddr: str, out_interface: str, task_id: str):
     run_iptables("-t", "filter", "-I", "FORWARD", "--source", ipaddr, "-o", out_interface, "-j", "ACCEPT")
 
     # in routing table add route table task_id
-    run(s.ip, "rule", "add", "fwmark", task_id, "lookup", task_id)
+    run(ServicePaths.ip, "rule", "add", "fwmark", task_id, "lookup", task_id)
 
     peer_ip = get_tun_peer_address(out_interface)
     if peer_ip:
         log.info("interface_route_enable %s has peer: %s ", out_interface, peer_ip)
-        run(s.ip, "route", "add", "default", "via", peer_ip, "table", task_id)
+        run(ServicePaths.ip, "route", "add", "default", "via", peer_ip, "table", task_id)
     else:
         log.error("interface_route_enable missing peer IP ")
 
@@ -868,12 +909,12 @@ def interface_route_tun_disable(ipaddr: str, out_interface: str, task_id: str):
     run_iptables("-t", "filter", "-D", "FORWARD", "--source", ipaddr, "-o", out_interface, "-j", "ACCEPT")
 
     # in routing table add route table task_id
-    run(s.ip, "rule", "del", "fwmark", task_id, "lookup", task_id)
+    run(ServicePaths.ip, "rule", "del", "fwmark", task_id, "lookup", task_id)
 
     peer_ip = get_tun_peer_address(out_interface)
     if peer_ip:
         log.info("interface_route_disable %s has peer %s", out_interface, peer_ip)
-        run(s.ip, "route", "del", "default", "via", peer_ip, "table", task_id)
+        run(ServicePaths.ip, "route", "del", "default", "via", peer_ip, "table", task_id)
     else:
         log.error("interface_route_disable missing peer IP ")
 
@@ -966,6 +1007,72 @@ def drop_disable(ipaddr, resultserver_port):
     run_iptables("-D", "OUTPUT", "--destination", ipaddr, "-j", "DROP")
 
 
+def sslproxy_enable(interface, client, proxy_port, resultserver_port, rt_table="", fwmark=""):
+    """Enable SSLproxy interception for a specific VM.
+
+    NAT REDIRECT sends all VM TCP (except ResultServer) to SSLproxy.
+    Per-analysis fwmark + ip rule routes SSLproxy upstream through the correct VPN.
+    """
+    log.info("Enabling SSLproxy for client %s (port=%s, fwmark=%s)", client, proxy_port, fwmark)
+
+    # Exclude ResultServer traffic
+    run_iptables("-t", "nat", "-I", "PREROUTING", "1",
+                 "-i", interface, "--source", client, "-p", "tcp",
+                 "--dport", resultserver_port, "-j", "ACCEPT")
+
+    # Redirect all other TCP from this VM to SSLproxy autossl listener
+    run_iptables("-t", "nat", "-I", "PREROUTING", "2",
+                 "-i", interface, "--source", client, "-p", "tcp",
+                 "-j", "REDIRECT", "--to", proxy_port)
+
+    # Accept connections to the SSLproxy listener port
+    run_iptables("-A", "INPUT", "-i", interface, "-p", "tcp",
+                 "--dport", proxy_port, "-m", "state", "--state", "NEW", "-j", "ACCEPT")
+
+    # Per-analysis cgroup + fwmark for upstream VPN routing
+    cgroup_path = f"sslproxy/{client}"
+    cgroup_dir = f"/sys/fs/cgroup/{cgroup_path}"
+    run("mkdir", "-p", cgroup_dir)
+    if rt_table and fwmark:
+        mark_hex = f"0x{int(fwmark):x}"
+        run_iptables("-t", "mangle", "-A", "OUTPUT",
+                     "-m", "cgroup", "--path", cgroup_path,
+                     "-p", "tcp", "-j", "MARK", "--set-mark", mark_hex)
+        run(ServicePaths.ip, "rule", "add", "fwmark", fwmark, "lookup", rt_table, "priority", "32750")
+        log.info("SSLproxy upstream routing: cgroup %s → fwmark %s → table %s", cgroup_path, fwmark, rt_table)
+
+
+def sslproxy_disable(interface, client, proxy_port, resultserver_port, rt_table="", fwmark=""):
+    """Disable SSLproxy interception for a specific VM."""
+    log.info("Disabling SSLproxy for client %s (fwmark=%s)", client, fwmark)
+
+    # Remove ResultServer exclusion
+    run_iptables("-t", "nat", "-D", "PREROUTING",
+                 "-i", interface, "--source", client, "-p", "tcp",
+                 "--dport", resultserver_port, "-j", "ACCEPT")
+
+    # Remove NAT REDIRECT
+    run_iptables("-t", "nat", "-D", "PREROUTING",
+                 "-i", interface, "--source", client, "-p", "tcp",
+                 "-j", "REDIRECT", "--to", proxy_port)
+
+    # Remove INPUT accept
+    run_iptables("-D", "INPUT", "-i", interface, "-p", "tcp",
+                 "--dport", proxy_port, "-m", "state", "--state", "NEW", "-j", "ACCEPT")
+
+    # Remove cgroup and routing rules
+    cgroup_path = f"sslproxy/{client}"
+    cgroup_dir = f"/sys/fs/cgroup/{cgroup_path}"
+    if rt_table and fwmark:
+        mark_hex = f"0x{int(fwmark):x}"
+        run_iptables("-t", "mangle", "-D", "OUTPUT",
+                     "-m", "cgroup", "--path", cgroup_path,
+                     "-p", "tcp", "-j", "MARK", "--set-mark", mark_hex)
+        run(ServicePaths.ip, "rule", "del", "fwmark", fwmark, "lookup", rt_table, "priority", "32750")
+    run("rmdir", cgroup_dir)
+
+
+
 handlers = {
     "nic_available": nic_available,
     "rt_available": rt_available,
@@ -1002,6 +1109,10 @@ handlers = {
     "disable_mitmdump": disable_mitmdump,
     "polarproxy_enable": polarproxy_enable,
     "polarproxy_disable": polarproxy_disable,
+    "libvirt_fwo_enable": libvirt_fwo_enable,
+    "libvirt_fwo_disable": libvirt_fwo_disable,
+    "sslproxy_enable": sslproxy_enable,
+    "sslproxy_disable": sslproxy_disable,
 }
 
 if __name__ == "__main__":
@@ -1064,10 +1175,10 @@ if __name__ == "__main__":
     os.chmod(settings.socket, stat.S_IRUSR | stat.S_IWUSR | stat.S_IWGRP)
 
     # Initialize global variables.
-    s.iptables = settings.iptables
-    s.iptables_save = settings.iptables_save
-    s.iptables_restore = settings.iptables_restore
-    s.ip = settings.ip
+    ServicePaths.iptables = settings.iptables
+    ServicePaths.iptables_save = settings.iptables_save
+    ServicePaths.iptables_restore = settings.iptables_restore
+    ServicePaths.ip = settings.ip
 
     # Simple object to allow a signal handler to stop the rooter loop
 

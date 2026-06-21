@@ -4,6 +4,7 @@
 # of the MIT license. See the LICENSE file for details.
 
 import inspect
+import importlib
 import logging
 import shutil
 import subprocess
@@ -36,7 +37,7 @@ def choose_package_class(file_type=None, file_name="", suggestion=None):
         sys.path.append(path.abspath(path.join(path.dirname(__file__), "..", "..")))
         # Since we don't know the package class yet, we'll just import everything
         # from this module and then try to figure out the required member class
-        module = __import__(full_name, globals(), locals(), ["*"])
+        module = importlib.import_module(full_name)
     except ImportError:
         raise Exception(f'Unable to import package "{name}": it does not exist')
     try:
@@ -56,22 +57,25 @@ def _found_target_class(module, name):
 
 
 def _guess_package_name(file_type, file_name):
-    if "Bourne-Again" in file_type or "bash" in file_type:
-        return "bash"
-    elif "Zip archive" in file_type:
-        return "zip"
-    elif "gzip compressed data" in file_type:
-        return "zip"
-    elif "PDF document" in file_type or file_name.endswith(".pdf"):
-        return "pdf"
-    elif "Composite Document File V2 Document" in file_type or file_name.endswith(".doc"):
-        return "doc"
-    elif "Microsoft Word" in file_type or file_name.endswith(".docx"):
-        return "doc"
-    elif "ELF" in file_type:
-        return "generic"
-    elif "Unicode text" in file_type or file_name.endswith(".js"):
-        return "js"
+    try:
+        if "Bourne-Again" in file_type or "bash" in file_type:
+            return "bash"
+        elif "Zip archive" in file_type:
+            return "zip"
+        elif "gzip compressed data" in file_type:
+            return "zip"
+        elif "PDF document" in file_type or file_name.endswith(".pdf"):
+            return "pdf"
+        elif "Composite Document File V2 Document" in file_type or file_name.endswith(".doc"):
+            return "doc"
+        elif "Microsoft Word" in file_type or file_name.endswith(".docx"):
+            return "doc"
+        elif "ELF" in file_type:
+            return "generic"
+        elif "Unicode text" in file_type or file_name.endswith(".js"):
+            return "js"
+    except (TypeError, AttributeError):
+        pass
     return None
 
 
@@ -101,9 +105,16 @@ class Package:
         self.timeout = kwargs.get("timeout")
         # Command-line arguments for the target.
 
-        _args = self.options.get("arguments", [])
-        if isinstance(_args, str):
-            self.args = _args.split()
+        def _args():
+            args = self.options.get("arguments")
+            if isinstance(args, list):
+                return args
+            if isinstance(args, str):
+                return args.split()
+            return []
+
+        self.args = _args()
+
         # Choose an analysis method (or fallback to apicalls)
         self.method = self.options.get("method", "apicalls")
         # Should our target be launched as root or not

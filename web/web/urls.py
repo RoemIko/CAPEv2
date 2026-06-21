@@ -29,11 +29,17 @@ from apiv2 import urls as apiv2
 from compare import urls as compare
 from dashboard import urls as dashboard
 from submission import urls as submission
+from audit import urls as audit
 
 handler403 = "web.views.handler403"
 handler404 = "web.views.handler404"
 
 urlpatterns = [
+    re_path(r"^guac/", include("guac.urls")),
+    # Per-user API key management (list / create / revoke). Mounted under
+    # /accounts/ so it sits next to allauth's login pages and naturally
+    # picks up @login_required. Must precede the allauth catch-all below.
+    path("accounts/api-keys/", include("apikey.urls")),
     path("accounts/", include("allauth.urls")),
     path("robots.txt", TemplateView.as_view(template_name="robots.txt", content_type="text/plain")),
     re_path(r"^$", dashboard_views.index, name="dashboard"),
@@ -53,4 +59,5 @@ urlpatterns = [
     ),
     re_path(r"^dashboard/", include(dashboard)),
     re_path(r"statistics/(?P<days>\d+)/$", analysis_views.statistics_data, name="statistics_data"),
+    re_path(r"^audit/", include(audit), name="audit"),
 ]

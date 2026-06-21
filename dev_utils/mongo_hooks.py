@@ -1,7 +1,10 @@
 import itertools
 import logging
+from contextlib import suppress
 
 from pymongo import UpdateOne, errors
+from pymongo.errors import InvalidDocument, BulkWriteError
+import bson
 
 from dev_utils.mongodb import (
     mongo_bulk_write,
@@ -58,16 +61,21 @@ def normalize_file(file_dict, task_id):
         "entrypoint",
         "data",
         "strings",
+        "type",
+        "yara",
+        "cape_yara",
+        "yara_hash",
+        "options_hash",
+        "clamav",
     )
     new_dict = {}
     for fld in static_fields:
-        try:
+        with suppress(KeyError):
             new_dict[fld] = file_dict.pop(fld)
-        except KeyError:
-            pass
 
     new_dict["_id"] = key
     file_dict[FILE_REF_KEY] = key
+
     return UpdateOne({"_id": key}, {"$set": new_dict, "$addToSet": {TASK_IDS_KEY: task_id}}, upsert=True, hint=[("_id", 1)])
 
 
@@ -87,8 +95,32 @@ def normalize_files(report):
     try:
         if requests:
             mongo_bulk_write(FILES_COLL, requests, ordered=False)
-    except errors.OperationFailure as exc:
-        log.error("Mongo hook 'normalize_files' failed with code %d: %s", exc.code, exc)
+    except (errors.OperationFailure, InvalidDocument, BulkWriteError) as exc:
+        log.warning("Mongo hook 'normalize_files' failed: %s. Attempting to sanitize strings and retry.", exc)
+        for req in requests:
+            # req._doc is the update document: {"$set": new_dict, ...}
+            # Accessing private attribute _doc to modify in place for retry
+            try:
+                if hasattr(req, "_doc") and "$set" in req._doc and "strings" in req._doc["$set"]:
+                    strings_val = req._doc["$set"]["strings"]
+                    # Check if strings field alone is too large (buffer safe 15MB)
+                    if strings_val and len(bson.encode({"strings": strings_val})) > 15 * 1024 * 1024:
+                        log.warning("Truncating oversized strings field for retry.")
+                        if isinstance(strings_val, list):
+                            req._doc["$set"]["strings"] = strings_val[:1000]
+                        else:
+                            req._doc["$set"]["strings"] = []
+                        # If still too large, clear it
+                        if len(bson.encode({"strings": req._doc["$set"]["strings"]})) > 15 * 1024 * 1024:
+                            req._doc["$set"]["strings"] = []
+            except Exception as e:
+                log.error("Failed to sanitize request during retry: %s", e)
+
+        # Retry the bulk write
+        try:
+            mongo_bulk_write(FILES_COLL, requests, ordered=False)
+        except Exception as retry_exc:
+            log.error("Retry of 'normalize_files' failed: %s", retry_exc)
 
     return report
 
@@ -98,40 +130,43 @@ def denormalize_files_from_reports(reports):
     """Pull the file info from the FILES_COLL collection in to associated parts of
     the reports.
     """
-    # Make sure we have a list whose objects we can modify in place instead of a mongo
-    # cursor as returned from mongo_find.
-    reports = list(reports)
-    file_dicts = [
-        file_dict
-        for file_dict in itertools.chain.from_iterable(collect_file_dicts(report) for report in reports)
-        if FILE_REF_KEY in file_dict
-    ]
-    if not file_dicts:
-        # These are likely partial reports (like for an ajax request of a specific
-        # part of the report), had a projection applied that does not include any file
-        # information, or only the old-style of storing file information is present in
-        # these documents.
-        return reports
+    def denormalize_generator(reports_iterable):
+        # Optimization: Ensure we have an iterator to avoid infinite loops on lists
+        reports_iter = iter(reports_iterable)
+        batch_size = 50
+        while True:
+            # Grab a batch of reports from the cursor
+            reports_batch = list(itertools.islice(reports_iter, batch_size))
+            if not reports_batch:
+                break
 
-    file_refs = {file_dict[FILE_REF_KEY] for file_dict in file_dicts}
+            file_dicts = [
+                file_dict
+                for file_dict in itertools.chain.from_iterable(collect_file_dicts(report) for report in reports_batch)
+                if FILE_REF_KEY in file_dict
+            ]
 
-    file_docs = {}
-    batch_size = 50
-    file_ref_iter = iter(file_refs)
-    while batch := tuple(itertools.islice(file_ref_iter, batch_size)):
-        # Reduce the size of the $in clause when there are large numbers of file refs by
-        # making multiple requests, passing batches of refs in.
-        for file_doc in mongo_find(FILES_COLL, {"_id": {"$in": batch}}, {TASK_IDS_KEY: 0}):
-            file_docs[file_doc.pop("_id")] = file_doc
+            if file_dicts:
+                file_refs = {file_dict[FILE_REF_KEY] for file_dict in file_dicts}
+                file_docs = {}
+                file_ref_batch_size = 50
+                file_ref_iter = iter(file_refs)
+                while batch := tuple(itertools.islice(file_ref_iter, file_ref_batch_size)):
+                    # Reduce the size of the $in clause when there are large numbers of file refs by
+                    # making multiple requests, passing batches of refs in.
+                    for file_doc in mongo_find(FILES_COLL, {"_id": {"$in": batch}}, {TASK_IDS_KEY: 0}):
+                        file_docs[file_doc.pop("_id")] = file_doc
 
-    for file_dict in file_dicts:
-        if file_dict[FILE_REF_KEY] not in file_docs:
-            log.warning("Failed to find %s in %s collection.", FILES_COLL, file_dict[FILE_REF_KEY])
-            continue
-        file_doc = file_docs[file_dict.pop(FILE_REF_KEY)]
-        file_dict.update(file_doc)
+                for file_dict in file_dicts:
+                    if file_dict[FILE_REF_KEY] not in file_docs:
+                        log.warning("Failed to find %s in %s collection.", FILES_COLL, file_dict[FILE_REF_KEY])
+                        continue
+                    file_doc = file_docs[file_dict.pop(FILE_REF_KEY)]
+                    file_dict.update(file_doc)
 
-    return reports
+            yield from reports_batch
+
+    return denormalize_generator(reports)
 
 
 @mongo_hook(mongo_find_one, "analysis")
@@ -139,7 +174,8 @@ def denormalize_files(report):
     """Pull the file info from the FILES_COLL collection in to associated parts of
     the report.
     """
-    denormalize_files_from_reports([report])
+    # Consume the generator so the report is denormalized in-place
+    list(denormalize_files_from_reports([report]))
     return report
 
 
@@ -150,7 +186,7 @@ def remove_task_references_from_files(task_ids):
     """
     mongo_update_many(
         FILES_COLL,
-        {TASK_IDS_KEY: {"$elemMatch": {"$in": task_ids}}},
+        {TASK_IDS_KEY: {"$in": task_ids}},
         {"$pullAll": {TASK_IDS_KEY: task_ids}},
     )
 
@@ -178,7 +214,8 @@ def delete_unused_file_docs():
     referenced by any analysis tasks. This should typically be invoked
     via utils/cleaners.py in a cron job.
     """
-    return mongo_delete_many(FILES_COLL, {TASK_IDS_KEY: {"$size": 0}})
+    # Using exact empty array match is much faster than $size: 0
+    return mongo_delete_many(FILES_COLL, {TASK_IDS_KEY: []})
 
 
 NORMALIZED_FILE_FIELDS = ("target.file", "dropped", "CAPE.payloads", "procdump", "procmemory")

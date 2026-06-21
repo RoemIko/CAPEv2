@@ -45,7 +45,8 @@ def mongo_id(value):
     """
     if isinstance(value, dict):
         if "_id" in value:
-            value = value["_id"]
+            return str(value.get("_id", ""))
+        return ""
 
     # Return value
     return str(value)
@@ -62,7 +63,7 @@ def get_item(dictionary, key):
     return dictionary.get(key, "")
 
 
-malware_name_url_pattern = """<a href="/analysis/search/detections:{malware_name}"><span style="color:#EE1B2F;font-weight: bold;">{malware_name}</span></a>"""
+malware_name_url_pattern = """<a href="/analysis/search/detections:{malware_name}"><span style="font-weight: bold;">{malware_name}</span></a>"""
 
 
 @register.filter("get_detection_by_pid")
@@ -252,3 +253,21 @@ def malware_config(obj, *args, **kwargs):
 def playback_url(task_id):
     session_id = uuid3(NAMESPACE_DNS, str(task_id)).hex[:16]
     return f"{task_id}_{session_id}"
+
+
+@register.filter
+def split_csv(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [t.strip() for t in str(value).split(",") if t.strip()]
+
+@register.filter
+def cert_chain_signers(signers):
+    return [s for s in (signers or []) if "Certificate Chain" in s.get("name", "")]
+
+
+@register.filter
+def ts_chain_signers(signers):
+    return [s for s in (signers or []) if "Timestamp Chain" in s.get("name", "")]

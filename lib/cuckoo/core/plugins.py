@@ -2,6 +2,7 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import importlib
 import inspect
 import json
 import logging
@@ -27,7 +28,7 @@ from lib.cuckoo.common.exceptions import (
 from lib.cuckoo.common.mapTTPs import mapTTP
 from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.common.scoring import calc_scoring
-from lib.cuckoo.common.utils import add_family_detection
+from lib.cuckoo.common.utils import add_family_detection, get_options, option_dict_enabled
 from lib.cuckoo.core.database import Database
 from utils.community_blocklist import blocklist
 
@@ -50,7 +51,7 @@ if blocklist.get("signatures"):
 
 def import_plugin(name):
     try:
-        module = __import__(name, globals(), locals(), ["dummy"])
+        module = importlib.import_module(name)
     except (ImportError, SyntaxError) as e:
         print(f'Unable to import plugin "{name}": {e}')
         return
@@ -152,7 +153,6 @@ class RunAuxiliary:
         stop():
             Stops all enabled auxiliary modules.
     """
-    """Auxiliary modules manager."""
 
     def __init__(self, task, machine):
         self.task = task
@@ -268,6 +268,10 @@ class RunProcessing:
         self.cfg = processing_cfg
         self.cuckoo_cfg = Config()
         self.results = results
+        task_opts = task.get("_options_parsed")
+        if not isinstance(task_opts, dict):
+            task_opts = get_options(task.get("options"))
+        self.minproc = option_dict_enabled(task_opts, "minproc")
 
     def process(self, module):
         """Run a processing module.
@@ -346,6 +350,14 @@ class RunProcessing:
         # If no modules are loaded, return an empty dictionary.
         if processing_list:
             processing_list.sort(key=lambda module: module.order)
+            if self.minproc:
+                allowed = {"AnalysisInfo", "BehaviorAnalysis", "Debug"}
+                processing_list = [module for module in processing_list if module.__name__ in allowed]
+                log.info(
+                    "minproc enabled for task %s: running minimal processing modules: %s",
+                    self.task.get("id"),
+                    ", ".join(module.__name__ for module in processing_list) or "none",
+                )
 
             # Run every loaded processing module.
             for module in processing_list:
@@ -801,18 +813,15 @@ class RunReporting:
             Returns:
                 int: A count of the reporting module errors.
     """
-    """Reporting Engine.
-
-    This class handles the loading and execution of the enabled reporting
-    modules. It receives the analysis results dictionary from the Processing
-    Engine and pass it over to the reporting modules before executing them.
-    """
 
     def __init__(self, task, results, reprocess=False):
         """@param analysis_path: analysis folder path."""
         self.task = task
 
         if results.get("pefiles"):
+            for pe in results["pefiles"].values():
+                with suppress(Exception):
+                    pe.close()
             del results["pefiles"]
 
         # remove unwanted/duplicate information from reporting
@@ -864,6 +873,7 @@ class RunReporting:
         current.set_options(options)
         # Load the content of the analysis.conf file.
         current.cfg = AnalysisConfig(current.conf_path)
+        current.reprocess = self.reprocess
 
         try:
             log.debug('Executing reporting module "%s"', current.__class__.__name__)
@@ -932,11 +942,6 @@ class GetFeeds:
             Runs all enabled feed modules.
             Returns:
                 None
-    """
-    """Feed Download and Parsing Engine
-
-    This class handles the downloading and modification of feed modules.
-    It then saves the parsed feed data to CUCKOO_ROOT/feeds/
     """
 
     def __init__(self, results):

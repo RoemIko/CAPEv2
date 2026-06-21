@@ -33,17 +33,17 @@ from lib.cuckoo.common.utils import (
     validate_referrer,
     validate_ttp,
 )
-from lib.cuckoo.core.database import (
+from lib.cuckoo.core.data.task import (
     ALL_DB_STATUSES,
     TASK_FAILED_ANALYSIS,
     TASK_FAILED_PROCESSING,
     TASK_FAILED_REPORTING,
     TASK_RECOVERED,
     TASK_REPORTED,
-    Database,
-    Sample,
     Task,
-)
+    )
+from lib.cuckoo.core.data.samples import Sample
+from lib.cuckoo.core.database import Database
 from lib.cuckoo.core.rooter import _load_socks5_operational, vpns
 from lib.downloaders import Downloaders
 
@@ -230,7 +230,7 @@ def load_vms_tags(force: bool = False):
     global _all_vms_tags
     with _load_vms_tags_lock:
         if _all_vms_tags is not None and not force:
-            return _all_vms_tags
+            return _all_vms_tags or []
         all_tags = []
         if HAVE_DIST and dist_conf.distributed.enabled:
             try:
@@ -242,11 +242,13 @@ def load_vms_tags(force: bool = False):
             except Exception as e:
                 print(e)
 
-        for machine in Database().list_machines(include_reserved=True):
+        machines = Database().list_machines(include_reserved=True)
+        for machine in machines:
             all_tags += [tag.name for tag in machine.tags if tag not in all_tags]
 
-        _all_vms_tags = list(sorted(set(all_tags)))
-        return _all_vms_tags
+        if machines:
+            _all_vms_tags = list(sorted(set(all_tags)))
+        return _all_vms_tags or []
 
 
 def top_asn(date_since: datetime = False, results_limit: int = 20) -> dict:
@@ -928,6 +930,7 @@ def download_file(**kwargs):
     if not static and "dist_extract" in kwargs["options"]:
         static = True
 
+    warnings = []
     for machine in kwargs.get("task_machines", []):
         if machine == "first":
             machine = None
@@ -959,7 +962,7 @@ def download_file(**kwargs):
             save_script_to_storage(task_ids_new, kwargs)
         except Exception as e:
             log.error("Error saving scripts to storage: %s", e)
-            return "error", {"error": "Error: Storing scripts to tempstorage"}
+            warnings.append({"script": f"{e}"})
 
         if isinstance(kwargs.get("task_ids", False), list):
             kwargs["task_ids"].extend(task_ids_new)
@@ -970,7 +973,8 @@ def download_file(**kwargs):
     if not onesuccess:
         return "error", {"error": f"Provided hash not found on {kwargs['service']}"}
 
-    return "ok", {"task_ids": kwargs["task_ids"], "errors": extra_details.get("errors", [])}
+    errors = extra_details.get("errors", []) + warnings
+    return "ok", {"task_ids": kwargs["task_ids"], "errors": errors}
 
 
 def save_script_to_storage(task_ids: list, kwargs):
@@ -1308,6 +1312,30 @@ normalized_int_terms = (
 )
 
 
+def _build_es_user_filter(privs: bool, user_id: int):
+    user_filter = None
+    if not privs:
+        if force_bool(web_cfg.general.get("public_searches", True)):
+            if not force_bool(web_cfg.tlp.get("public_red", False)):
+                shoulds = [{"bool": {"must_not": [{"terms": {"info.tlp": ["red", "Red", "RED"]}}]}}]
+                if user_id:
+                    shoulds.append({"term": {"info.user_id": user_id}})
+                else:
+                    shoulds.append({"bool": {"must_not": {"exists": {"field": "info.user_id"}}}})
+                user_filter = {
+                    "bool": {
+                        "should": shoulds,
+                        "minimum_should_match": 1
+                    }
+                }
+        else:
+            if user_id:
+                user_filter = {"term": {"info.user_id": user_id}}
+            else:
+                user_filter = {"bool": {"must_not": {"exists": {"field": "info.user_id"}}}}
+    return user_filter
+
+
 def perform_search(
     term: str, value: str, search_limit: int = 0, user_id: int = 0, privs: bool = False, web: bool = True, projection: dict = None
 ):
@@ -1328,6 +1356,10 @@ def perform_search(
     """
     if repconf.mongodb.enabled and repconf.elasticsearchdb.enabled and essearch and not term:
         multi_match_search = {"query": {"multi_match": {"query": value, "fields": ["*"]}}}
+        if not privs:
+            user_filter = _build_es_user_filter(privs, user_id)
+            if user_filter:
+                multi_match_search = {"query": {"bool": {"must": [{"multi_match": {"query": value, "fields": ["*"]}}], "filter": [user_filter]}}}
         numhits = es.search(index=get_analysis_index(), body=multi_match_search, size=0)["hits"]["total"]
         return [
             d["_source"]
@@ -1385,7 +1417,10 @@ def perform_search(
     elif term == "malscore":
         query_val = {"$gte": float(value)}
     else:
-        query_val = {"$regex": value, "$options": "i"}
+        if re.search(r"[\^\$\|\?\*\+\(\)\[\]\{\}]", value):
+            query_val = {"$regex": value, "$options": "i"}
+        else:
+            query_val = value
 
     if term not in search_term_map:
         return None
@@ -1399,6 +1434,7 @@ def perform_search(
         query_val = {"$exists": True}
 
     retval = []
+    mongo_search_query = None
     if repconf.mongodb.enabled and query_val:
         if term in hash_searches:
             # The file details are uniq, and we store 1 to many. So where hash type is uniq, IDs are list
@@ -1417,10 +1453,21 @@ def perform_search(
                 {"$unwind": "$task_doc"},
                 # Stage 8: Make the task doc the new root
                 {"$replaceRoot": {"newRoot": "$task_doc"}},
-                # Stage 9: Add your custom projection
-                {"$project": perform_search_filters},
             ]
+
+            if not privs:
+                if force_bool(web_cfg.general.get("public_searches", True)):
+                    if not force_bool(web_cfg.tlp.get("public_red", False)):
+                        pipeline.append({"$match": {"$or": [{"info.tlp": {"$nin": ["red", "Red", "RED"]}}, {"info.user_id": user_id}]}})
+                else:
+                    pipeline.append({"$match": {"info.user_id": user_id}})
+
+            # Stage 9: Add your custom projection
+            pipeline.append({"$project": projection or perform_search_filters})
+
             retval = list(mongo_aggregate(FILES_COLL, pipeline))
+            if not retval:
+                return []
         elif isinstance(search_term_map[term], str):
             mongo_search_query = {search_term_map[term]: query_val}
         elif isinstance(search_term_map[term], list):
@@ -1429,14 +1476,30 @@ def perform_search(
             print(f"Unknown search {term}:{value}")
             return []
 
-        # Allow to overwrite perform_search_filters for custom results
-        if not projection:
-            projection = perform_search_filters
-        if "target.file.sha256" in projection:
-            projection = dict(**projection)
-            projection[f"target.file.{FILE_REF_KEY}"] = 1
-        if not retval:
+        if not retval and mongo_search_query:
+            # Allow to overwrite perform_search_filters for custom results
+            if not projection:
+                projection = perform_search_filters
+            if "target.file.sha256" in projection:
+                projection = dict(**projection)
+                projection[f"target.file.{FILE_REF_KEY}"] = 1
+            if term in search_term_map_repetetive_blocks:
+                mongo_search_query = {"$or": [{path: condition} for path, condition in mongo_search_query.items()]}
+
+            if not privs:
+                if force_bool(web_cfg.general.get("public_searches", True)):
+                    if not force_bool(web_cfg.tlp.get("public_red", False)):
+                        mongo_search_query = {
+                            "$and": [
+                                mongo_search_query,
+                                {"$or": [{"info.tlp": {"$nin": ["red", "Red", "RED"]}}, {"info.user_id": user_id}]}
+                            ]
+                        }
+                else:
+                    mongo_search_query["info.user_id"] = user_id
+
             retval = list(mongo_find("analysis", mongo_search_query, projection, limit=search_limit))
+
         for doc in retval:
             target_file = doc.get("target", {}).get("file", {})
             if FILE_REF_KEY in target_file and "sha256" not in target_file:
@@ -1444,13 +1507,20 @@ def perform_search(
         return retval
 
     if es_as_db:
-        _source_fields = list(perform_search_filters.keys())[:-1]
+        _source_fields = list((projection or perform_search_filters).keys())[:-1]
+
+        user_filter = _build_es_user_filter(privs, user_id)
+
         if isinstance(search_term_map[term], str):
             q = {"query": {"match": {search_term_map[term]: value}}}
+            if user_filter:
+                q = {"query": {"bool": {"must": [q["query"]], "filter": [user_filter]}}}
             return [d["_source"] for d in es.search(index=get_analysis_index(), body=q, _source=_source_fields)["hits"]["hits"]]
         else:
             queries = [{"match": {search_term: value}} for search_term in search_term_map[term]]
             q = {"query": {"bool": {"should": queries, "minimum_should_match": 1}}}
+            if user_filter:
+                q["query"]["bool"]["filter"] = [user_filter]
             return [d["_source"] for d in es.search(index=get_analysis_index(), body=q, _source=_source_fields)["hits"]["hits"]]
 
 
@@ -1535,10 +1605,10 @@ def parse_request_arguments(request, keyword="POST"):
     tags = getattr(request, keyword).get("tags")
     custom = getattr(request, keyword).get("custom", "")
     memory = force_bool(getattr(request, keyword).get("memory", False))
-    clock = getattr(request, keyword).get("clock", datetime.now().strftime("%m-%d-%Y %H:%M:%S"))
+    clock = getattr(request, keyword).get("clock", "")
     if not clock:
-        clock = datetime.now().strftime("%m-%d-%Y %H:%M:%S")
-    if "1970" in clock:
+        clock = datetime.utcfromtimestamp(0)
+    elif "1970" in clock:
         clock = datetime.now().strftime("%m-%d-%Y %H:%M:%S")
     enforce_timeout = force_bool(getattr(request, keyword).get("enforce_timeout", False))
     unique = force_bool(getattr(request, keyword).get("unique", False))
@@ -1605,53 +1675,54 @@ def process_new_task_files(request, samples: list, details: dict, opt_filename: 
     """
     list_of_files = []
     for sample in samples:
-        # Error if there was only one submitted sample, and it's empty.
-        # But if there are multiple and one was empty, just ignore it.
-        if not sample.size:
-            details["errors"].append({sample.name: "You uploaded an empty file."})
-            continue
+        with sample:
+            # Error if there was only one submitted sample, and it's empty.
+            # But if there are multiple and one was empty, just ignore it.
+            if not sample.size:
+                details["errors"].append({sample.name: "You uploaded an empty file."})
+                continue
 
-        size = sample.size
-        if size > web_cfg.general.max_sample_size and not (
-            web_cfg.general.allow_ignore_size and "ignore_size_check" in details["options"]
-        ):
-            if not web_cfg.general.enable_trim:
+            size = sample.size
+            if size > web_cfg.general.max_sample_size and not (
+                web_cfg.general.allow_ignore_size and "ignore_size_check" in details["options"]
+            ):
+                if not web_cfg.general.enable_trim:
+                    details["errors"].append(
+                        {
+                            sample.name: f"Uploaded file exceeds the maximum allowed size in conf/web.conf. Sample size is: {size / float(1 << 20):,.0f} Allowed size is: {web_cfg.general.max_sample_size / float(1 << 20):,.0f}"
+                        }
+                    )
+                    continue
+
+            data = sample.read()
+
+            if opt_filename:
+                filename = opt_filename
+            else:
+                filename = sanitize_filename(sample.name)
+
+            # Moving sample from django temporary file to CAPE temporary storage for persistence, if configured by user.
+            try:
+                path = store_temp_file(data, filename)
+                target_file = File(path)
+                sha256 = target_file.get_sha256()
+            except OSError:
                 details["errors"].append(
-                    {
-                        sample.name: f"Uploaded file exceeds the maximum allowed size in conf/web.conf. Sample size is: {size / float(1 << 20):,.0f} Allowed size is: {web_cfg.general.max_sample_size / float(1 << 20):,.0f}"
-                    }
+                    {filename: "Temp folder from cuckoo.conf, disk is out of space. Clean some space before continue."}
                 )
                 continue
 
-        data = sample.read()
+            if (
+                not request.user.is_staff
+                and (web_cfg.uniq_submission.enabled or unique)
+                and db.check_file_uniq(sha256, hours=web_cfg.uniq_submission.hours)
+            ):
+                details["errors"].append(
+                    {filename: "Duplicated file, disable unique option on submit or in conf/web.conf to force submission"}
+                )
+                continue
 
-        if opt_filename:
-            filename = opt_filename
-        else:
-            filename = sanitize_filename(sample.name)
-
-        # Moving sample from django temporary file to CAPE temporary storage for persistence, if configured by user.
-        try:
-            path = store_temp_file(data, filename)
-            target_file = File(path)
-            sha256 = target_file.get_sha256()
-        except OSError:
-            details["errors"].append(
-                {filename: "Temp folder from cuckoo.conf, disk is out of space. Clean some space before continue."}
-            )
-            continue
-
-        if (
-            not request.user.is_staff
-            and (web_cfg.uniq_submission.enabled or unique)
-            and db.check_file_uniq(sha256, hours=web_cfg.uniq_submission.hours)
-        ):
-            details["errors"].append(
-                {filename: "Duplicated file, disable unique option on submit or in conf/web.conf to force submission"}
-            )
-            continue
-
-        list_of_files.append((data, path, sha256))
+            list_of_files.append((data, path, sha256))
 
     return list_of_files, details
 
@@ -1688,78 +1759,6 @@ def process_new_dlnexec_task(url: str, route: str, options: str, custom: str):
     path = store_temp_file(response, name)
 
     return path, response, ""
-
-
-def submit_task(
-    target: str,
-    package: str = "",
-    timeout: int = 0,
-    task_options: str = "",
-    priority: int = 1,
-    machine: str = "",
-    platform: str = "",
-    memory: bool = False,
-    enforce_timeout: bool = False,
-    clock: str = None,
-    tags: str = None,
-    parent_id: int = None,
-    tlp: bool = None,
-    distributed: bool = False,
-    filename: str = "",
-    server_url: str = "",
-):
-    """
-    ToDo add url support in future
-    """
-    if not path_exists(target):
-        log.info("File doesn't exist")
-        return
-
-    task_id = False
-    if distributed:
-        options = {
-            "package": package,
-            "timeout": timeout,
-            "options": task_options,
-            "priority": priority,
-            # "machine": machine,
-            "platform": platform,
-            "memory": memory,
-            "enforce_timeout": enforce_timeout,
-            "clock": clock,
-            "tags": tags,
-            "parent_id": parent_id,
-            "filename": filename,
-        }
-
-        multipart_file = [("file", (os.path.basename(target), open(target, "rb")))]
-        try:
-            res = requests.post(server_url, files=multipart_file, data=options)
-            if res and res.ok:
-                task_id = res.json()["data"]["task_ids"][0]
-        except Exception as e:
-            log.error(e)
-    else:
-        task_id = db.add_path(
-            file_path=target,
-            package=package,
-            timeout=timeout,
-            options=task_options,
-            priority=priority,
-            machine=machine,
-            platform=platform,
-            memory=memory,
-            enforce_timeout=enforce_timeout,
-            parent_id=parent_id,
-            tlp=tlp,
-            filename=filename,
-        )
-    if not task_id:
-        log.warning("Error adding CAPE task to database: %s", package)
-        return task_id
-
-    log.info('CAPE detection on file "%s": %s - added as CAPE task with ID %s', target, package, task_id)
-    return task_id
 
 
 # https://stackoverflow.com/questions/14989858/get-the-current-git-hash-in-a-python-script/68215738#68215738

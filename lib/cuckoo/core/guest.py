@@ -107,19 +107,27 @@ class GuestManager:
 
             try:
                 r = session.get(url, *args, **kwargs)
-            except requests.ConnectionError:
+            except requests.ConnectionError as e:
                 raise CuckooGuestError(
                     "CAPE Agent failed without error status, please try "
                     "upgrading to the latest version of agent.py (>= 0.10) and "
-                    "notify us if the issue persists"
+                    "notify us if the issue persists. Error: %s", str(e)
                 )
 
         do_raise and r.raise_for_status()
         return r
 
     def get_status_from_db(self) -> str:
+        # Force SQLAlchemy to dump its cache and look at the real DB
         with db.session.begin():
-            return db.guest_get_status(self.task_id)
+            db.session.expire_all()
+            status = db.guest_get_status(self.task_id)
+
+        # Handle the case where the task was already deleted by race condition
+        if status is None:
+            return "deleted"
+
+        return status
 
     def set_status_in_db(self, status: str):
         with db.session.begin():
@@ -134,11 +142,11 @@ class GuestManager:
 
         try:
             r = session.post(url, *args, **kwargs)
-        except requests.ConnectionError:
+        except requests.ConnectionError as e:
             raise CuckooGuestError(
                 "CAPE Agent failed without error status, please try "
                 "upgrading to the latest version of agent.py (>= 0.10) and "
-                "notify us if the issue persists"
+                "notify us if the issue persists. Error: %s", str(e)
             )
 
         r.raise_for_status()
@@ -300,6 +308,18 @@ class GuestManager:
         # Upload the analyzer.
         self.upload_analyzer()
 
+        # Update file_name in options if category is file/archive to include task-id unique subdirectory
+        # This must be done BEFORE self.add_config(options) is called so that analysis.conf in guest has the correct path
+        if options["category"] in ("file", "archive"):
+            if "subdir_upload" in features:
+                if self.platform == "windows":
+                    options["file_name"] = f"{options['id']}\\{sanitize_filename(options['file_name'])}"
+                else:
+                    options["file_name"] = f"{options['id']}/{sanitize_filename(options['file_name'])}"
+            else:
+                options["file_name"] = sanitize_filename(options["file_name"])
+
+
         # Pass along the analysis.conf file.
         self.add_config(options)
         # Allow Auxiliary modules to prepare the Guest.
@@ -320,9 +340,9 @@ class GuestManager:
         if options["category"] in ("file", "archive"):
             # Use the correct os.sep in the filepath based on what OS this file is destined for
             if self.platform == "windows":
-                filepath = ntpath.join(self.determine_temp_path(), sanitize_filename(options["file_name"]))
+                filepath = ntpath.join(self.determine_temp_path(), options["file_name"])
             else:
-                filepath = os.path.join(self.determine_temp_path(), sanitize_filename(options["file_name"]))
+                filepath = os.path.join(self.determine_temp_path(), options["file_name"])
             data = {"filepath": filepath}
             files = {
                 "file": ("sample.bin", open(sample_path, "rb")),
@@ -356,8 +376,35 @@ class GuestManager:
     def wait_for_completion(self):
         count = 0
         start = timeit.default_timer()
+        current_status = ""
+        consecutive_failures = 0
+        # --- REWORKED: TIMEOUT CALCULATION ---
+        # 1. Detect None/0: If self.timeout is missing/infinite, use system default.
+        #    This prevents "infinite patience" if the task submission was malformed.
+        effective_timeout = self.timeout
+        if not effective_timeout:
+            effective_timeout = cfg.timeouts.default
 
-        while self.do_run and self.get_status_from_db() == "running":
+        # 2. Add Critical Buffer: This is the "Grace Period" for shutdown/reporting.
+        #    e.g., 200s (analysis) + 60s (critical) = 260s Hard Limit.
+        hard_limit = effective_timeout + cfg.timeouts.critical
+
+        while self.do_run:
+            # FORCE REFRESH: Tell SQLAlchemy to expire the cache and fetch fresh data
+            # Note: Depending on your exact Cuckoo version, the session access might vary.
+            # This is the generic fix:
+            try:
+                # Re-fetch the task status directly from DB logic
+                current_status = self.get_status_from_db()
+            except Exception:
+                # If the task was deleted, this query might fail.
+                # If it fails, we should ABORT.
+                log.info("Task #%s: Task deleted or DB error. Aborting.", self.task_id)
+                return
+
+            if current_status != "running":
+                break
+
             time.sleep(1)
 
             if cfg.cuckoo.machinery_screenshots:
@@ -369,23 +416,33 @@ class GuestManager:
             if count % 5 == 0:
                 log.debug("Task #%s: Analysis is still running (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
 
-            # If the analysis hits the critical timeout, just return straight
-            # away and try to recover the analysis results from the guest.
-            if timeit.default_timer() - start > self.timeout:
-                log.info("Task #%s: End of analysis reached! (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
+            # --- REWORKED: HARD STOP ENFORCEMENT ---
+            # If we exceed the (Timeout + Critical) limit, we kill the loop.
+            # This handles the case where the Agent is dead (network timeout)
+            # and the 'except' block below keeps "continuing" forever.
+            if timeit.default_timer() - start > hard_limit:
+                log.error(
+                    "Task #%s: Hard Timeout reached! (Running for %ds, Limit %ds). "
+                    "Agent is likely unresponsive.",
+                    self.task_id,
+                    timeit.default_timer() - start,
+                    hard_limit
+                )
+                self.set_status_in_db("failed")
                 return
 
             try:
                 status = self.get("/status", timeout=5).json()
-            except (CuckooGuestError, requests.exceptions.ReadTimeout):
-                # this might fail due to timeouts or just temporary network
-                # issues thus we don't want to abort the analysis just yet and
-                # wait for things to recover
-                log.warning(
-                    "Task #%s: Virtual Machine %s /status failed. This can indicate the guest losing network connectivity",
-                    self.task_id,
-                    self.vmid,
-                )
+            except (CuckooGuestError, requests.exceptions.ReadTimeout) as e:
+                # Add a counter for consecutive failures
+                consecutive_failures += 1  # You need to init this to 0 outside loop
+
+                log.warning("Task #%s: Agent unreachable (%s/10). Error: %s", self.task_id, consecutive_failures, e)
+
+                # If we fail 10 times in a row (approx 10-15 seconds), give up.
+                if consecutive_failures > 10:
+                    log.error("Task #%s: Agent is dead. Virtual Machine %s /status failed. This can indicate the guest losing network connectivity. Killing analysis.", self.task_id, self.vmid)
+                    return # Or raise exception
                 continue
             except Exception as e:
                 log.exception("Task #%s: Virtual machine %s /status failed. %s", self.task_id, self.vmid, e)
